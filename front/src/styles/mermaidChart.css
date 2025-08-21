@@ -1,0 +1,76 @@
+.mermaid-container {
+    overflow: visible; /* Changed from hidden to visible */
+    position: relative;
+  }
+  
+  .mermaid-chart {
+    display: block !important; /* Force display */
+    visibility: visible !important; /* Force visibility */
+  }
+  
+  .mermaid-chart svg {
+    max-width: 100%;
+    display: block !important; /* Force display */
+    visibility: visible !important; /* Force visibility */
+  }
+  
+  /* Make sure dark theme elements are visible */
+  .mermaid-chart .label {
+    color: white !important;
+    fill: white !important;
+  }
+  
+  .mermaid-chart .node rect, 
+  .mermaid-chart .node circle, 
+  .mermaid-chart .node polygon {
+    stroke: white !important;
+  }
+  
+  .mermaid-chart .edgePath .path {
+    stroke: white !important;
+  }
+
+  .mermaid-chart text {
+    fill: #ffffff !important;
+    color: #ffffff !important;
+  }
+  
+  .mermaid-chart .label {
+    color: #ffffff !important;
+    fill: #ffffff !important;
+  }
+  
+  .mermaid-chart .cluster-label text {
+    fill: #ffffff !important;
+  }
+  
+  .mermaid-chart .nodeLabel {
+    color: #ffffff !important;
+    fill: #ffffff !important;
+  }
+  
+  /* Adjust backgrounds for better contrast */
+  .mermaid-chart .node rect, 
+  .mermaid-chart .node circle, 
+  .mermaid-chart .node polygon,
+  .mermaid-chart .node path {
+    fill: #1e1e2f !important;
+    stroke: #aaaaaa !important;
+  }
+  
+  /* Make sure subgraph backgrounds aren't too dark */
+  .mermaid-chart .cluster rect {
+    fill: #2a2a42 !important;
+    stroke: #aaaaaa !important;
+  }
+  
+  /* Make sure edge lines are visible */
+  .mermaid-chart .edgePath .path {
+    stroke: #ffffff !important;
+    stroke-width: 1.5px !important;
+  }
+  
+  .mermaid-chart .edgeLabel {
+    background-color: #2a2a42 !important;
+    color: #ffffff !important;
+  }
