@@ -4,83 +4,106 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import os
 from dotenv import load_dotenv, find_dotenv
-
-load_dotenv(dotenv_path=find_dotenv('.env.development'))
 from pathlib import Path
+import shutil
 
-# Obtén la ruta absoluta a la carpeta docs
+# .env (usa .env.development si lo tienes)
+#load_dotenv(dotenv_path=find_dotenv('.env.development'))
+
+# Rutas robustas ancladas a back/
 BASE_DIR = Path(__file__).resolve().parent.parent
 DOCS_DIR = BASE_DIR / "docs"
-CHROMA_DB_DIR = "./chroma_db"
+CHROMA_DB_DIR = BASE_DIR / "chroma_db"   
+
+# Loader (lee TODO lo que haya en docs/)
 loader = DirectoryLoader(str(DOCS_DIR))
+
 COLLECTION_NAME = "rag-chroma"
+
+def _add_metadata(docs):
+    """
+    Normaliza y enriquece metadatos para cada documento:
+    - source_path: ruta original del archivo
+    - title: nombre base del archivo (sirve para filtrar/citar)
+    """
+    for d in docs:
+        d.metadata = d.metadata or {}
+        # Algunos loaders guardan 'source', otros 'file_path'
+        source = d.metadata.get("source") or d.metadata.get("file_path") or ""
+        d.metadata.setdefault("source_path", str(source))
+        # Título por defecto: nombre del archivo sin extensión
+        if source:
+            d.metadata.setdefault("title", Path(source).stem)
+        else:
+            d.metadata.setdefault("title", "docs")
+    return docs
 
 def create_or_load_vectorstore():
     """
-    Creates a new Chroma database if it doesn't exist,
-    or loads an existing one if it does.
+    Crea la BD de Chroma si no existe; si existe, la carga.
     """
-    # Check if the database already exists
-    embedding = OpenAIEmbeddings()
-    
-    if os.path.exists(CHROMA_DB_DIR) and os.listdir(CHROMA_DB_DIR):
+    embedding = OpenAIEmbeddings(
+        model=os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-large"),
+        api_key=os.getenv("OPENAI_API_KEY")
+    )
+
+    if CHROMA_DB_DIR.exists() and any(CHROMA_DB_DIR.iterdir()):
         print(f"Loading existing Chroma DB from {CHROMA_DB_DIR}")
-        # Load the existing database
         vectorstore = Chroma(
-            persist_directory=CHROMA_DB_DIR,
+            persist_directory=str(CHROMA_DB_DIR),
             embedding_function=embedding,
             collection_name=COLLECTION_NAME
         )
     else:
         print(f"Creating new Chroma DB at {CHROMA_DB_DIR}")
-        # Create the directory if it doesn't exist
-        os.makedirs(CHROMA_DB_DIR, exist_ok=True)
-        
-        # Load documents
-        loader = DirectoryLoader(str(DOCS_DIR))
+        CHROMA_DB_DIR.mkdir(parents=True, exist_ok=True)
+
+        # 1) Cargar documentos
         docs = loader.load()
-        
-        # Split documents
+
+        # 2) Añadir metadatos útiles (source_path, title)
+        docs = _add_metadata(docs)
+
+        # 3) Split (chunking)
         text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-            chunk_size=100, chunk_overlap=50
+            chunk_size=1200,
+            chunk_overlap=150,
+            separators=["\n\n", "\n", ".", " "]
         )
         doc_splits = text_splitter.split_documents(docs)
-        
-        # Create and persist the vectorstore
+
+        # 4) Construir y persistir Chroma
         vectorstore = Chroma.from_documents(
             documents=doc_splits,
             collection_name=COLLECTION_NAME,
             embedding=embedding,
-            persist_directory=CHROMA_DB_DIR
+            persist_directory=str(CHROMA_DB_DIR)
         )
-        # Make sure to persist the database
         vectorstore.persist()
-    
+
     return vectorstore
 
-def get_retriever():
+def get_retriever(title: str = None, k: int = 4):
     """
-    Returns a retriever from the vector store.
-    This is the function you should call from your FastAPI endpoint.
+    Devuelve un retriever del vector store.
+    Si pasas 'title', filtra los chunks al libro/archivo con ese título.
     """
     vectorstore = create_or_load_vectorstore()
-    return vectorstore.as_retriever()
+    if title:
+        return vectorstore.as_retriever(
+            search_kwargs={"k": k, "filter": {"title": {"$eq": title}}}
+        )
+    return vectorstore.as_retriever(search_kwargs={"k": k})
 
 def rebuild_vectorstore():
     """
-    Deletes the existing database and creates a new one.
-    Only use this when you want to rebuild the database (e.g., after updating documents).
+    Borra la BD existente y la reconstruye (úsalo si cambiaste docs/ o parámetros).
     """
-    import shutil
-    if os.path.exists(CHROMA_DB_DIR):
+    if CHROMA_DB_DIR.exists():
         print(f"Removing existing Chroma DB at {CHROMA_DB_DIR}")
         shutil.rmtree(CHROMA_DB_DIR)
-    
     return create_or_load_vectorstore()
 
-"""
-if __name__ == "__main__":
-    vectorstore = create_or_load_vectorstore()
-    print(f"Vector store is ready with {vectorstore._collection.count()} documents")
-
-"""
+# if __name__ == "__main__":
+#     vs = create_or_load_vectorstore()
+#     print("✅ Vectorstore listo")
