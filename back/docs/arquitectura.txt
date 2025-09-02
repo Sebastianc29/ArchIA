@@ -1,0 +1,1 @@
+Información sobre arquitectura de software y patrones de diseño.

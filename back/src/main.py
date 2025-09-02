@@ -4,8 +4,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 import os
 import sqlite3
-
+from contextlib import asynccontextmanager
 from src.graph import graph
+from src.rag_agent import create_or_load_vectorstore
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        print("RAG warmup: buiding/ loading vectorstore...")
+        create_or_load_vectorstore()
+        print("Vectorstore ready.")
+    except Exception as e:
+        print(f"Error during vectorstore setup: {e}")
+    yield
+app = FastAPI(lifespan=lifespan)
 
 # ===================== Rutas robustas (independientes del cwd) =====================
 BACK_DIR = Path(__file__).resolve().parent.parent          # .../back/
