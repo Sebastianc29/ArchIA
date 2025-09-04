@@ -108,16 +108,14 @@ async def message(
     if not session_id:
         raise HTTPException(status_code=400, detail="No session ID provided")
 
-    # ID incremental por sesión
     message_id = get_next_message_id(session_id)
 
-    # Guardar imágenes (si llegan)
     image_path1 = ""
     if image1 and image1.filename:
         dest1 = IMAGES_DIR / image1.filename
         with open(dest1, "wb") as f:
             f.write(await image1.read())
-        image_path1 = str(dest1)  # ruta absoluta para uso interno en el back
+        image_path1 = str(dest1)
 
     image_path2 = ""
     if image2 and image2.filename:
@@ -126,18 +124,23 @@ async def message(
             f.write(await image2.read())
         image_path2 = str(dest2)
 
-    # Mensajes para el agente
     messageList = [{"role": "user", "content": message}]
     if image_path1:
         messageList.append({"role": "user", "content": "this is the image path: " + image_path1})
     if image_path2:
         messageList.append({"role": "user", "content": "this is the second image path: " + image_path2})
 
-    # Thread por sesión
     config = {"configurable": {"thread_id": str(session_id)}}
 
-    # Invocar el grafo
     try:
+        # limpia estado residual si existe
+        try:
+            state = graph.get_state(config)
+            if state:
+                graph.update_state(config, {"endMessage": "", "mermaidCode": ""})
+        except Exception:
+            pass
+
         result = graph.invoke(
             {
                 "messages": messageList,
@@ -146,26 +149,32 @@ async def message(
                 "hasVisitedInvestigator": False,
                 "hasVisitedCreator": False,
                 "hasVisitedEvaluator": False,
-                "hasVisitedASR": False,   # <-- corregido (antes: hasVisitedDiagrams)
+                "hasVisitedASR": False,
                 "nextNode": "supervisor",
                 "imagePath1": image_path1,
                 "imagePath2": image_path2,
                 "endMessage": "",
                 "mermaidCode": "",
+                # 🔹 CLAVE: buffer vacío de turno
+                "turn_messages": [],
             },
             config,
         )
     except Exception as e:
-        # Log simple y error 500 legible al front
         raise HTTPException(status_code=500, detail=f"Graph error: {e}")
 
-    # Registrar feedback base para ese mensaje (0/0)
     upsert_feedback(session_id=session_id, message_id=message_id, up=0, down=0)
 
-    # Respuesta incluyendo IDs
-    result["message_id"] = message_id
-    result["session_id"] = session_id
-    return result
+    # 🔹 CLAVE: devolvemos SOLO lo de este turno
+    clean_payload = {
+        "endMessage": result.get("endMessage", ""),
+        "mermaidCode": result.get("mermaidCode", ""),
+        "messages": result.get("turn_messages", []),  # <-- aquí el modal leerá SOLO lo de este turno
+        "session_id": session_id,
+        "message_id": message_id,
+    }
+    return clean_payload
+
 
 @app.post("/feedback")
 async def feedback(
@@ -192,3 +201,4 @@ async def test_endpoint(message: str = Form(...), file: UploadFile = File(None))
             {"name": "researcher", "text": "Mensaje del investigador"},
         ],
     }
+

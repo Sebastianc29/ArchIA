@@ -2,19 +2,23 @@
 # Environments / Secrets
 # =========================
 .env
-.env.development
-.env.local
-.env.production.local
-.env.test.local
-.env.development.local
+.env.*
+# keep only templates/examples
+!.env.example
+!.env.template
+!back/.env.example
+!front/.env.example
 
+# =========================
 # Virtual environments
+# =========================
 .venv/
 venv/
 ENV/
 env/
 env.bak/
 venv.bak/
+.python-version
 
 # =========================
 # Python
@@ -49,15 +53,21 @@ images/
 logs/
 *.log
 *.db
+*.sqlite
 *.sqlite3
 chroma_db/
+back/chroma_db/
 feedback_db/
 state_db/
 
 # =========================
-# Docs (ignorados por defecto)
+# Docs (ignored by default)
 # =========================
 docs/
+
+# --- Allowlist RAG source docs (version only sources, not index) ---
+!back/docs/
+!back/docs/**
 
 # =========================
 # Frontend / Node
@@ -88,15 +98,9 @@ Thumbs.db
 *.njsproj
 *.sln
 *.sw?
+desktop.ini
 
 # =========================
 # Project-specific
 # =========================
 tesisdbmarquia-cb23d2034301.json
-
-# =========================
-# --- Allowlist RAG source docs ---
-# (Versiona SOLO los documentos fuente. El índice chroma_db/ NO se sube)
-# =========================
-!back/docs/
-!back/docs/**

@@ -107,3 +107,37 @@ def rebuild_vectorstore():
 # if __name__ == "__main__":
 #     vs = create_or_load_vectorstore()
 #     print("✅ Vectorstore listo")
+# src/rag_agent.py
+import os
+from pathlib import Path
+
+# usa el paquete nuevo (quita el warning)
+try:
+    from langchain_chroma import Chroma
+except Exception:
+    from langchain_community.vectorstores import Chroma
+
+from langchain_openai import OpenAIEmbeddings
+# ... (otros imports)
+
+# === ruta por defecto: back/chroma_db ===
+PROJECT_ROOT = Path(__file__).resolve().parents[1]   # .../back
+DEFAULT_CHROMA_DIR = str((PROJECT_ROOT / "chroma_db").resolve())
+
+def create_or_load_vectorstore():
+    persist_directory = os.environ.get("CHROMA_DIR", DEFAULT_CHROMA_DIR)
+    print(f"[RAG] persist_directory = {persist_directory}")
+
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+
+    # si ya existe algo, solo cargar
+    if os.path.isdir(persist_directory) and any(Path(persist_directory).iterdir()):
+        print(f"Loading existing Chroma DB from {persist_directory}")
+        return Chroma(
+            collection_name="arquia",
+            embedding_function=embeddings,
+            persist_directory=persist_directory,
+        )
+
+    # ... aquí tu código para crear el índice si no existe (o delega al build)
+    # (puedes mantener el resto como lo tienes)

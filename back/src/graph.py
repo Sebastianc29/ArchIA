@@ -66,6 +66,7 @@ class GraphState(TypedDict):
     endMessage: str
     hasVisitedASR: bool 
     mermaidCode: str
+    turn_messages:list
 
 class AgentState(TypedDict):
     messages: list
@@ -235,6 +236,16 @@ def getEvaluatorPrompt(image_path1: str, image_path2) -> str:
         """
     return evaluatorPrompt
 
+def _push_turn(state: GraphState, role: str, name: str, content: str) -> None:
+    """Guarda una línea en el log del turno actual (modal de 'Mensajes Internos')."""
+    line = {"role": role, "name": name, "content": content}
+    state["turn_messages"] = state.get("turn_messages", []) + [line]
+
+def _reset_turn(state: GraphState) -> GraphState:
+    """Reinicia el buffer del turno (se llama al inicio de la ejecución)."""
+    return {**state, "turn_messages": []}
+
+
 # ===== Tools
 
 llm_prompt = "Retrieve general software architecture knowledge. Answer concisely and focus on key concepts: fill the 3 sections of the anwser allways: [definition, useCases, examples]"
@@ -282,11 +293,37 @@ def LLMWithImages(image_path: str) -> str:
     ])
     return response
 
+# ===== Investigator tools (reemplaza SOLO local_RAG) =====
 @tool
 def local_RAG(prompt: str) -> str:
-    """This researcher is able of answering questions about software architecture, but only about performance and scalability."""
-    response = retriever.invoke(prompt)
-    return response
+    """This researcher answers about performance & scalability using local documents.
+    It returns a short synthesis followed by a SOURCES block for UI consumption."""
+    docs = retriever.invoke(prompt)
+    if not docs:
+        return "No local documents were retrieved for this query."
+
+    # pequeño resumen con los primeros documentos (evita respuestas larguísimas)
+    preview_chunks = []
+    for i, d in enumerate(docs[:3], start=1):
+        snippet = (d.page_content or "")[:600].strip()
+        preview_chunks.append(f"[{i}] {snippet}")
+
+    # fuentes abreviadas y normalizadas
+    src_lines = []
+    for d in docs:
+        title = d.metadata.get("title") or Path(d.metadata.get("source_path", "")).stem or "doc"
+        page = d.metadata.get("page_label") or d.metadata.get("page")
+        src = d.metadata.get("source_path") or d.metadata.get("source") or ""
+        page_str = f" (p.{page})" if page is not None else ""
+        src_lines.append(f"- {title}{page_str} — {src}")
+
+    body = "\n\n".join(preview_chunks)
+    sources = "\n".join(src_lines)
+    return f"""{body}
+
+SOURCES:
+{sources}
+"""
 
 # ===== Evaluator
 
@@ -349,46 +386,65 @@ def supervisor_node(state: GraphState):
     message = [
         {"role": "system", "content": makeSupervisorPrompt(state)},
     ]
-    
     response = llm.with_structured_output(supervisorSchema).invoke(message)
+
+    next_node = response["nextNode"]
+    # 👉 Fallback: si aún no pasó por ningún worker, fuerza uno razonable
+    if next_node == "unifier" and not (
+        state["hasVisitedInvestigator"] or state["hasVisitedCreator"] or
+        state["hasVisitedEvaluator"] or state.get("hasVisitedASR", False)
+    ):
+        uq = (state.get("userQuestion") or "").lower()
+        if state.get("imagePath1") or state.get("imagePath2") or "diagram" in uq or "mermaid" in uq:
+            next_node = "creator"          # prioriza crear diagrama si lo piden
+        else:
+            next_node = "investigator"     # si no, investigar primero
 
     state_updated: GraphState = {
         **state,
         "localQuestion": response["localQuestion"],
-        "nextNode": response["nextNode"]
+        "nextNode": next_node,
     }
     return state_updated
 
 # ===== Investigator
     
 researcher_agent = create_react_agent(llm, tools=[LLM, LLMWithImages, local_RAG])
+
 def researcher_node(state: GraphState) -> GraphState:
-    # Agrega el mensaje del sistema al inicio
     system_message = SystemMessage(content=prompt_researcher)
+    _push_turn(state, role="system", name="researcher_system", content=prompt_researcher)
+
     messages_with_system = [system_message] + state["messages"]
-    
     result = researcher_agent.invoke({
-        "messages": messages_with_system,  # Usa los mensajes con el sistema
+        "messages": messages_with_system,
         "userQuestion": state["userQuestion"],
         "localQuestion": state["localQuestion"],
         "imagePath1": state["imagePath1"],
         "imagePath2": state["imagePath2"]
     })
+
+    # Guarda todas las salidas del agente como parte del log del turno
+    for msg in result["messages"]:
+        # msg.content ya es texto (para tool calls puede venir estructurado)
+        _push_turn(state, role="assistant", name="researcher", content=str(getattr(msg, "content", msg)))
+
     return {
         **state,
         "messages": state["messages"] + [AIMessage(content=msg.content, name="researcher") for msg in result["messages"]],
         "hasVisitedInvestigator": True
     }
-# ===== Creator
 
+# ===== Creator
 def creator_node(state: GraphState) -> GraphState:
-    
+    _push_turn(state, role="system", name="creator_system", content=prompt_creator + state["userQuestion"])
+
     response = llm.invoke(prompt_creator + state["userQuestion"])
 
     match = re.search(r"```mermaid\n(.*?)```", response.content, re.DOTALL)
-    mermaid_code = ""
-    if match:
-        mermaid_code = match.group(1)
+    mermaid_code = match.group(1) if match else ""
+
+    _push_turn(state, role="assistant", name="creator", content=response.content)
 
     return {
         **state,
@@ -398,14 +454,13 @@ def creator_node(state: GraphState) -> GraphState:
     }
 
 # ===== Evaluator
-
 def evaluator_node(state: GraphState) -> GraphState:
     evaluator_agent = create_react_agent(llm, tools=[theory_tool, viability_tool, needs_tool, analyze_tool])
-    
-    # Agrega el mensaje del sistema
-    system_message = SystemMessage(content=getEvaluatorPrompt(state["imagePath1"], state["imagePath2"]))
-    messages_with_system = [system_message] + state["messages"]
-    
+
+    eval_prompt = getEvaluatorPrompt(state["imagePath1"], state["imagePath2"])
+    _push_turn(state, role="system", name="evaluator_system", content=eval_prompt)
+
+    messages_with_system = [SystemMessage(content=eval_prompt)] + state["messages"]
     result = evaluator_agent.invoke({
         "messages": messages_with_system,
         "userQuestion": state["userQuestion"],
@@ -413,61 +468,69 @@ def evaluator_node(state: GraphState) -> GraphState:
         "imagePath1": state["imagePath1"],
         "imagePath2": state["imagePath2"]
     })
+
+    for msg in result["messages"]:
+        _push_turn(state, role="assistant", name="evaluator", content=str(getattr(msg, "content", msg)))
+
     return {
         **state,
         "messages": state["messages"] + [AIMessage(content=msg.content, name="evaluator") for msg in result["messages"]],
         "hasVisitedEvaluator": True
     }
+
 # ===== Unifier
-
 def unifier_node(state: GraphState) -> GraphState:
-    prompt = f"""You are an expert assistant in information synthesis. You will receive a list of messages that may contain 
-    scattered ideas, arguments, questions, and answers.
+    # Toma la última contribución por rol (si existe)
+    def last_by(name: str) -> str:
+        for m in reversed(state["messages"]):
+            if isinstance(m, AIMessage) and m.name == name and m.content:
+                return m.content
+        return ""
 
-    YOUR MOST IMPORTANT TASK: Format your response using MULTIPLE CLEARLY SEPARATED PARAGRAPHS.
-    
-    Specific requirements:
-    1. Organize the information into 2-4 distinct paragraphs minimum.
-    2. Each paragraph must focus on exactly one main idea or theme.
-    3. Use proper paragraph breaks (double line breaks) between paragraphs.
-    4. Never merge all content into a single paragraph.
-    5. Prioritize readability through clear structure over completeness.
-    6. NEVER add mermaid code to the last message. there is another way to show the diagram to the user.
-    
-    Synthesize this information into a well-structured response: {state['messages']}"""
+    parts = []
+    parts.append(f"User question:\n{state['userQuestion']}")
+    for role in ["researcher", "evaluator", "asr_evaluator", "asr_recommender", "creator"]:
+        c = last_by(role)
+        if c:
+            parts.append(f"{role} says:\n{c}")
+
+    synthesis_source = "\n\n".join(parts)
+
+    prompt = f"""You are an expert assistant in information synthesis.
+Format your response in multiple short paragraphs (2–4). 
+Do not repeat earlier turns verbatim. Be concise and only use the content below.
+
+=== SOURCE BEGIN ===
+{synthesis_source}
+=== SOURCE END ===
+
+Important:
+- Keep only NEW synthesis for the current turn.
+- Do not restate the full context; avoid redundancy.
+- NEVER include mermaid code here.
+"""
     response = llm.invoke(prompt)
-    return {
-        **state,
-        "endMessage": response.content
-    }
-
+    return {**state, "endMessage": response.content}
 # ===== ASR
-
 def asr_node(state: GraphState) -> GraphState:
     if state["imagePath1"]:
         prompt = f"""You are an expert in software architecture implementation evaluation.
-            The user has provided the following details:
-            {state["userQuestion"]}
-
-            An implementation diagram is available at: {state["imagePath1"]}.
-
-            Evaluate whether the implementation meets the requirements and respects the limitations mentioned in the user question.
-            Provide detailed feedback and suggestions for improvement if needed.
-            Also it is **IMPORTANT** to analize the implementation of architectural tactics in the user diagram. If there are no architectural tactics in the diagram, please recommend which architectural tactics can be applied.
-            """
+{state["userQuestion"]}
+An implementation diagram is available at: {state["imagePath1"]}.
+..."""
+        _push_turn(state, role="system", name="asr_system", content=prompt)
         result = llm.invoke(prompt)
         message = AIMessage(content=result.content, name="asr_evaluator")
     else:
         prompt = f"""You are an expert in providing recommendations for software architecture.
-            The user has provided the following details:
-            {state["userQuestion"]}.
-
-            Provide clear recommendations and a step-by-step guide on how to implement the requirement considering the limitations mentioned in the user question.
-            It is **IMPORTANT** that in the answer you mention architectural tactics that are important in the implementation of ASR.
-            """
+{state["userQuestion"]}
+..."""
+        _push_turn(state, role="system", name="asr_system", content=prompt)
         result = llm.invoke(prompt)
         message = AIMessage(content=result.content, name="asr_recommender")
-    
+
+    _push_turn(state, role="assistant", name=str(message.name), content=message.content)
+
     return {
         **state,
         "messages": state["messages"] + [message],

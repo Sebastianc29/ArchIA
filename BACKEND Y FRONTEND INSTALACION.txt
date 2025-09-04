@@ -1,0 +1,115 @@
+BACKEND Y FRONTEND:
+
+BACKEND:
+
+cd C:\Users\Julian\Documents\j.parraf\ArquIA-main\back
+
+# Activa el entorno
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+pip install fastapi
+pip install langgraph
+pip install fastapi uvicorn[standard] python-multipart python-dotenv
+pip install "langchain>=0.2" "langchain-community>=0.2" "langgraph>=0.2.0" langgraph-checkpoint-sqlite
+pip install "chromadb>=0.5.5" "pypdf" "tiktoken" "sentence-transformers<3.0"
+pip install "openai>=1.40" "langchain-openai>=0.1.18"
+mkdir feedback_db
+# Instala LangChain y dependencias relacionadas
+pip install langchain langchain-community langchain-openai
+
+# Instala el backend de vector store (ChromaDB)
+pip install chromadb
+
+# Instala procesamiento de documentos
+pip install pypdf tiktoken
+
+# Instala embeddings (puedes elegir entre OpenAI o HuggingFace)
+pip install sentence-transformers
+
+# O si prefieres usar OpenAI embeddings:
+pip install openai
+
+pip install python-magic-bin
+# Instala el checkpoint para SQLite de LangGraph
+pip install langgraph-checkpoint-sqlite
+
+#Es necesario crear también el .env y añadir el token de OPENAI_API_KEY, #LANGSMITH_API_KEY y TAVILY_API_KEY
+#Tambien crear el .env.development y añadir los tokens nuevamente
+#Finalmente, crear el langgraph.json que sea asi:
+
+{
+  "graphs": { "arquia": "./src/graph.py:graph" },
+  "dependencies": ["."],
+  "env": ".env"
+}
+
+
+#En la terminal también hacer
+$env:OPENAI_API_KEY = ""
+gci -r -i *.py | sls -Pattern 'create_or_load_vectorstore\(' -List | % Path 
+#OR
+Get-ChildItem -Path . -Recurse -Include *.py -File |
+>>   Where-Object { $_.FullName -notmatch '\\(\.venv|venv|node_modules|\.git)\\' } |      
+>>   Select-String -Pattern 'create_or_load_vectorstore\(' -List |
+>>   Select-Object -ExpandProperty Path -Unique
+
+
+pip install "unstructured[pdf]"
+pip install pdf2image
+pip install poppler-utils   # (en Linux/Mac). En Windows, instala Poppler manualmente.
+
+pip install google-cloud-aiplatform vertexai
+
+pip install "unstructured[pdf]" pdf2image pillow
+
+$env:PATH = "C:\poppler\bin;$env:PATH"
+
+# 0) (opcional) quitar variable de entorno previa para que no override-e       
+Remove-Item Env:CHROMA_DIR -ErrorAction SilentlyContinue 
+
+# 1) Instala el paquete nuevo de Chroma (recomendado)    
+pip install -U langchain-chroma
+
+
+# 3) Lanza el backend (misma consola)
+
+
+# Agrega algunos documentos de prueba
+ni .\docs\ejemplo.txt -Value "Este es un documento de prueba para el sistema RAG."
+ni .\docs\arquitectura.txt -Value "Información sobre arquitectura de software y patrones de diseño."
+
+
+# Construcción normal (no borra si ya existe)
+python .\build_vectorstore.py
+
+# Forzar reconstrucción
+python .\build_vectorstore.py --rebuild
+
+
+python -m uvicorn src.main:app --port 8000
+
+FRONTEND:
+
+# ¿Está en Program Files?
+if (Test-Path "C:\Program Files\nodejs\node.exe") {
+  $env:Path += ";C:\Program Files\nodejs"
+}
+
+# ¿O en tu perfil (instalación por usuario)?
+if (Test-Path "$env:LOCALAPPDATA\Programs\node\node.exe") {
+  $env:Path += ";$env:LOCALAPPDATA\Programs\node"
+}
+
+node -v
+npm -v
+
+
+cd C:\Users\Julian\Documents\j.parraf\ArquIA-main\front
+
+npm install
+
+ni .env.local -Value 'VITE_API_BASE=http://localhost:8000'
+npm run dev
+

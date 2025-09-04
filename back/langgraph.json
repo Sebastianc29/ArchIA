@@ -1,0 +1,5 @@
+{
+  "graphs": { "arquia": "./src/graph.py:graph" },
+  "dependencies": ["."],
+  "env": ".env"
+}
