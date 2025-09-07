@@ -1,26 +1,41 @@
 from typing import Optional
-from fastapi import FastAPI, Form, File, UploadFile, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
-import os
-import sqlite3
+import os, re, sqlite3
+
+from fastapi import UploadFile, File, Form, HTTPException, Request, FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+
 from src.graph import graph
 from src.rag_agent import create_or_load_vectorstore
+from src.memory import init as memory_init, get as memory_get, set_kv as memory_set
 
+memory_init()
+
+# ===================== Detección simple de idioma (ES/EN) ==========================
+def detect_lang(q: str) -> str:
+    ql = (q or "").lower()
+    if re.search(r"[áéíóúñ¿¡]", ql): return "es"
+    if re.search(r"\b(what|how|why|when|which|where|who|the|and|or|if|is|are|can|do|does|should|would)\b", ql): return "en"
+    ascii_ratio = sum(1 for c in q if ord(c) < 128) / max(1, len(q))
+    return "en" if ascii_ratio > 0.97 else "es"
+
+# ===================== Lifespan ==========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
-        print("RAG warmup: buiding/ loading vectorstore...")
         create_or_load_vectorstore()
-        print("Vectorstore ready.")
+        print("[startup] RAG listo")
     except Exception as e:
-        print(f"Error during vectorstore setup: {e}")
+        print(f"[startup] RAG init omitido: {e}")
     yield
-app = FastAPI(lifespan=lifespan)
+    print("[shutdown] Cerrando app...")
 
-# ===================== Rutas robustas (independientes del cwd) =====================
-BACK_DIR = Path(__file__).resolve().parent.parent          # .../back/
+# Una sola instancia de FastAPI (evita duplicados)
+app = FastAPI(title="ArquIA API", lifespan=lifespan)
+
+# ===================== Paths ==========================
+BACK_DIR = Path(__file__).resolve().parent.parent  # .../back/
 IMAGES_DIR = BACK_DIR / "images"
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -28,7 +43,7 @@ FEEDBACK_DIR = BACK_DIR / "feedback_db"
 FEEDBACK_DIR.mkdir(parents=True, exist_ok=True)
 FEEDBACK_DB_PATH = FEEDBACK_DIR / "feedback.db"
 
-# ===================== DB de feedback: init y conexión única ======================
+# ===================== DB Feedback ======================
 def init_feedback_db() -> sqlite3.Connection:
     conn = sqlite3.connect(str(FEEDBACK_DB_PATH), check_same_thread=False)
     conn.execute(
@@ -49,12 +64,8 @@ feedback_conn = init_feedback_db()
 
 def get_next_message_id(session_id: str) -> int:
     cur = feedback_conn.cursor()
-    cur.execute(
-        "SELECT MAX(message_id) FROM message_feedback WHERE session_id = ?",
-        (session_id,),
-    )
+    cur.execute("SELECT MAX(message_id) FROM message_feedback WHERE session_id = ?", (session_id,))
     row = cur.fetchone()
-    # Si no hay mensajes aún para esa sesión, arrancamos en 1
     return (row[0] or 0) + 1
 
 def upsert_feedback(session_id: str, message_id: int, up: int = 0, down: int = 0):
@@ -71,10 +82,7 @@ def update_feedback(session_id: str, message_id: int, up: int, down: int):
     )
     feedback_conn.commit()
 
-# ===================== FastAPI + CORS =============================================
-app = FastAPI(title="ArquIA API")
-
-# Permite front local. Agrega 127.0.0.1 por si abres así el front.
+# ===================== CORS ==============================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -86,6 +94,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ===================== Health ===========================
 @app.get("/")
 def root():
     return {"status": "ok", "docs": "/docs", "health": "/health"}
@@ -94,10 +103,10 @@ def root():
 def health():
     return {"status": "ok"}
 
-# ===================== Endpoints ===================================================
-
+# ===================== /message =========================
 @app.post("/message")
 async def message(
+    request: Request,
     message: str = Form(...),
     session_id: str = Form(...),
     image1: Optional[UploadFile] = File(None),
@@ -108,8 +117,10 @@ async def message(
     if not session_id:
         raise HTTPException(status_code=400, detail="No session ID provided")
 
+    user_id = request.headers.get("X-User-Id") or session_id
     message_id = get_next_message_id(session_id)
 
+    # --- imágenes opcionales ---
     image_path1 = ""
     if image1 and image1.filename:
         dest1 = IMAGES_DIR / image1.filename
@@ -124,27 +135,36 @@ async def message(
             f.write(await image2.read())
         image_path2 = str(dest2)
 
+    # --- mensajes base para el grafo ---
     messageList = [{"role": "user", "content": message}]
     if image_path1:
         messageList.append({"role": "user", "content": "this is the image path: " + image_path1})
     if image_path2:
         messageList.append({"role": "user", "content": "this is the second image path: " + image_path2})
 
+    # --- memoria previa ---
+    last_topic = memory_get(user_id, "topic", "")
+    asr_notes  = memory_get(user_id, "asr_notes", "")
+    memory_text = f"Tema previo: {last_topic}. ASR previas: {asr_notes}".strip() or "N/A"
+
     config = {"configurable": {"thread_id": str(session_id)}}
+    user_lang = detect_lang(message)
 
+    # limpia estado residual si existe
     try:
-        # limpia estado residual si existe
-        try:
-            state = graph.get_state(config)
-            if state:
-                graph.update_state(config, {"endMessage": "", "mermaidCode": ""})
-        except Exception:
-            pass
+        state = graph.get_state(config)
+        if state:
+            graph.update_state(config, {"endMessage": "", "mermaidCode": ""})
+    except Exception:
+        pass
 
+    # --- invocación grafo ---
+    try:
         result = graph.invoke(
             {
                 "messages": messageList,
                 "userQuestion": message,
+                "userLang": user_lang,
                 "localQuestion": "",
                 "hasVisitedInvestigator": False,
                 "hasVisitedCreator": False,
@@ -155,27 +175,43 @@ async def message(
                 "imagePath2": image_path2,
                 "endMessage": "",
                 "mermaidCode": "",
-                # 🔹 CLAVE: buffer vacío de turno
                 "turn_messages": [],
+                "retrieved_docs": [],
+                "memory_text": memory_text,
+                "suggestions": [],
+                "language": user_lang,
+                "intent": "general",
+                "force_rag": False,
             },
             config,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Graph error: {e}")
 
+    # feedback inicial
     upsert_feedback(session_id=session_id, message_id=message_id, up=0, down=0)
 
-    # 🔹 CLAVE: devolvemos SOLO lo de este turno
+    # memoria simple (tema/ASR)
+    low = message.lower()
+    if "latencia" in low:
+        memory_set(user_id, "topic", "latencia")
+    elif "escalabilidad" in low:
+        memory_set(user_id, "topic", "escalabilidad")
+    if "asr" in message.lower():
+        memory_set(user_id, "asr_notes", message)
+
+    # payload del turno actual
     clean_payload = {
         "endMessage": result.get("endMessage", ""),
         "mermaidCode": result.get("mermaidCode", ""),
-        "messages": result.get("turn_messages", []),  # <-- aquí el modal leerá SOLO lo de este turno
+        "messages": result.get("turn_messages", []),
         "session_id": session_id,
         "message_id": message_id,
+        "suggestions": result.get("suggestions", []),
     }
     return clean_payload
 
-
+# ===================== /feedback ========================
 @app.post("/feedback")
 async def feedback(
     session_id: str = Form(...),
@@ -186,19 +222,17 @@ async def feedback(
     update_feedback(session_id=session_id, message_id=message_id, up=thumbs_up, down=thumbs_down)
     return {"status": "Feedback recorded successfully"}
 
-# Endpoint de prueba (mock) opcional para el front
+# ===================== /test (mock) =====================
 @app.post("/test")
 async def test_endpoint(message: str = Form(...), file: UploadFile = File(None)):
     if not message:
         raise HTTPException(status_code=400, detail="No message provided")
 
-    user_input = message
     return {
-        "mermaidCode": "classDiagram\nA --> B",
-        "endMessage": "this is a response to " + user_input,
+        "mermaidCode": "flowchart LR\nA-->B",
+        "endMessage": "this is a response to " + message,
         "messages": [
             {"name": "Supervisor", "text": "Mensaje del supervisor"},
             {"name": "researcher", "text": "Mensaje del investigador"},
         ],
     }
-

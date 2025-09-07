@@ -1,9 +1,9 @@
-import React, { useState, useRef, useEffect } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import MermaidChart from "./MermaidChart";
 import {
-  Box, Paper, List, ListItem, TextField, Button, Typography,
-  Dialog, DialogTitle, DialogContent, ListItemText, IconButton,
-  Badge, Chip, Stack, Tooltip, Divider, CircularProgress
+  Box, Paper, List, ListItem, TextField, Button, Typography, Dialog,
+  DialogTitle, DialogContent, ListItemText, IconButton, Badge, Chip, Stack,
+  Tooltip, Divider, CircularProgress, Drawer, ListItemButton
 } from "@mui/material";
 import AttachFileIcon from "@mui/icons-material/AttachFile";
 import CloseIcon from "@mui/icons-material/Close";
@@ -11,143 +11,241 @@ import ImageIcon from "@mui/icons-material/Image";
 import ThumbUpIcon from "@mui/icons-material/ThumbUp";
 import ThumbDownIcon from "@mui/icons-material/ThumbDown";
 import MoreHorizIcon from "@mui/icons-material/MoreHoriz";
+import EditOutlinedIcon from "@mui/icons-material/EditOutlined";
+import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
+import ChatBubbleOutlineIcon from "@mui/icons-material/ChatBubbleOutline";
 import ScienceIcon from "@mui/icons-material/Science";
-
 import "../styles/chat.css";
 
-const uuid = () => (crypto?.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random()));
+// ------------ Utils
+const uuid = () =>
+  (crypto?.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random()));
 
-/** ——— Helpers de UI/analítica del turno ——— **/
-
-// Saca un mini “conteo por rol” (deduplicado por nombre)
-const summarizeRoles = (internal = []) => {
-  const counts = new Map();
-  const order = ["supervisor_prompt","supervisor_decision","researcher","evaluator","creator","asr"];
-  internal.forEach((m) => {
-    const k = (m.name || m.role || "other").toLowerCase();
-    counts.set(k, (counts.get(k) || 0) + 1);
-  });
-  const ordered = order.filter(k => counts.has(k)).map(k => [k, counts.get(k)]);
-  const rest = [...counts.entries()].filter(([k]) => !order.includes(k));
-  return [...ordered, ...rest];
+const STORAGE_KEYS = {
+  SESSIONS: "arquia.sessions",
+  MESSAGES: (sid) => `arquia.chat.${sid}`,
 };
 
-// Encuentra bloque SOURCES: que devuelve local_RAG y lo parsea
-const extractRagSources = (internal = []) => {
-  const sources = [];
-  for (const m of internal) {
-    const text = String(m.content || "");
-    const idx = text.indexOf("\nSOURCES:\n");
-    if (idx !== -1) {
-      const lines = text.substring(idx + "\nSOURCES:\n".length).split("\n");
-      for (const ln of lines) {
-        const t = ln.trim();
-        if (t.startsWith("- ")) sources.push(t.slice(2));
-      }
-    }
-  }
-  return sources;
+const titleFrom = (text) => {
+  const t = (text || "").trim();
+  if (!t) return "New chat";
+  const firstLine = t.split("\n")[0].slice(0, 60);
+  return firstLine || "New chat";
 };
+
+// Fallback follow-ups (English)
+const followups = (userText) => {
+  const t = (userText || "").toLowerCase();
+  const base = [
+    "Want a component diagram for this?",
+    "See common scalability tactics?",
+    "Do you want an ASR example?",
+    "Would you like a deployment view?",
+    "Should I propose trade-offs and risks?"
+  ];
+  const lat = [
+    "Drill into latency root-cause patterns?",
+    "Show a checklist to reduce response time?"
+  ];
+  const sca = [
+    "Compare horizontal vs vertical scaling?",
+    "See partitioning and replication options?"
+  ];
+  const add = [
+    "Walk through ADD 3.0 steps?",
+    "Map drivers → QAs → tactics for your case?"
+  ];
+  let extra = [];
+  if (/\blatenc/i.test(t)) extra = lat;
+  if (/\bscalab|scale|throughput/i.test(t)) extra = extra.concat(sca);
+  if (/\badd\b|attribute driven/i.test(t)) extra = extra.concat(add);
+  const unique = [...new Set([...extra, ...base])].slice(0, 5);
+  return `\n\n---\n**Suggested follow-ups:**\n- ${unique.join("\n- ")}`;
+};
+
+// storage helpers
+const loadSessions = () => {
+  try { return JSON.parse(localStorage.getItem(STORAGE_KEYS.SESSIONS) || "[]"); } catch { return []; }
+};
+const saveSessions = (arr) => localStorage.setItem(STORAGE_KEYS.SESSIONS, JSON.stringify(arr));
+const loadChat = (sid) => {
+  try { return JSON.parse(localStorage.getItem(STORAGE_KEYS.MESSAGES(sid)) || "[]"); } catch { return []; }
+};
+const saveChat = (sid, msgs) => localStorage.setItem(STORAGE_KEYS.MESSAGES(sid), JSON.stringify(msgs));
 
 export default function Chat() {
-  const [messages, setMessages] = useState([]);
+  // Drawer (escucha al header global)
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  useEffect(() => {
+    const handler = () => setDrawerOpen((p) => !p);
+    window.addEventListener("arquia-toggle-drawer", handler);
+    return () => window.removeEventListener("arquia-toggle-drawer", handler);
+  }, []);
+
+  // Sessions
+  const [sessions, setSessions] = useState(loadSessions());
+  const [sessionId, setSessionId] = useState(() => sessions?.[0]?.id || uuid());
+
+  // Chat state
+  const [messages, setMessages] = useState(() => loadChat(sessionId));
   const [input, setInput] = useState("");
+  const [attachedImages, setAttachedImages] = useState([]);
   const [openDialog, setOpenDialog] = useState(false);
   const [selectedInternalMessages, setSelectedInternalMessages] = useState([]);
   const [selectedRagSources, setSelectedRagSources] = useState([]);
-  const [attachedImages, setAttachedImages] = useState([]);
-  const [sessionId, setSessionId] = useState("");
+  const [ratedMessages, setRatedMessages] = useState(new Set());
   const fileInputRef = useRef(null);
   const requestSeq = useRef(0);
-  const [ratedMessages, setRatedMessages] = useState(new Set());
 
   useEffect(() => {
-    const newSessionId = uuid();
-    setSessionId(newSessionId);
-    console.log(`New session created with ID: ${newSessionId}`);
+    if (sessions.length === 0) {
+      const first = { id: sessionId, title: "New chat", createdAt: Date.now() };
+      const arr = [first];
+      setSessions(arr); saveSessions(arr); saveChat(sessionId, []);
+    } else {
+      setMessages(loadChat(sessionId));
+    }
   }, []);
 
-  const sendMessage = async () => {
-    if (!input.trim() && attachedImages.length === 0) return;
+  useEffect(() => { setMessages(loadChat(sessionId)); }, [sessionId]);
 
-    const userId = uuid();
-    const pendingId = "pending-" + uuid();
-    const currentSeq = ++requestSeq.current;
+  // RAG parse helpers
+  const summarizeRoles = (internal = []) => {
+    const counts = new Map();
+    const order = ["supervisor_prompt","supervisor_decision","researcher","evaluator","creator","asr","small_talk"];
+    internal.forEach((m) => {
+      const k = (m.name || m.role || "other").toLowerCase();
+      counts.set(k, (counts.get(k) || 0) + 1);
+    });
+    const ordered = order.filter(k => counts.has(k)).map(k => [k, counts.get(k)]);
+    const rest = [...counts.entries()].filter(([k]) => !order.includes(k));
+    return [...ordered, ...rest];
+  };
+  const extractRagSources = (internal = []) => {
+    const out = [];
+    for (const m of internal) {
+      const text = String(m.content || "");
+      const idx = text.indexOf("\nSOURCES:\n");
+      if (idx !== -1) {
+        const lines = text.substring(idx + "\nSOURCES:\n".length).split("\n");
+        for (const ln of lines) { const t = ln.trim(); if (t.startsWith("- ")) out.push(t.slice(2)); }
+      }
+    }
+    return out;
+  };
 
-    // pinta turno
-    setMessages(prev => ([
-      ...prev,
-      { id: userId, sender: "usuario", text: input, images: attachedImages.map(img => img.preview) },
-      { id: pendingId, sender: "respuesta", text: "", pending: true }
-    ]));
-
-    // payload
-    const formData = new FormData();
-    formData.append("message", input);
-    formData.append("session_id", sessionId);
-    attachedImages.forEach((img, index) => formData.append(`image${index + 1}`, img.file));
-
-    // limpia UI
-    setInput(""); setAttachedImages([]); if (fileInputRef.current) fileInputRef.current.value = "";
-
-    try {
-      const resp = await fetch("http://localhost:8000/message", { method: "POST", body: formData });
-      const data = await resp.json();
-      if (currentSeq !== requestSeq.current) return;
-
-      setMessages(prev =>
-        prev.map(m =>
-          m.id === pendingId
-            ? {
-                ...m,
-                pending: false,
-                text: data.endMessage,
-                internal_messages: Array.isArray(data.messages) ? data.messages : [],
-                mermaidCode: data.mermaidCode,
-                session_id: data.session_id,
-                message_id: data.message_id
-              }
-            : m
-        )
-      );
-    } catch (e) {
-      console.error("Error:", e);
-      setMessages(prev =>
-        prev.map(m =>
-          m.id === pendingId
-            ? { ...m, pending: false, text: "⚠️ Ocurrió un error al obtener la respuesta." }
-            : m
-        )
-      );
+  // sessions ops
+  const createSession = () => {
+    const id = uuid();
+    const s = { id, title: "New chat", createdAt: Date.now() };
+    const arr = [s, ...sessions];
+    setSessions(arr); saveSessions(arr); setSessionId(id); saveChat(id, []); setDrawerOpen(false);
+  };
+  const renameSession = (id, title) => {
+    const arr = sessions.map((s) => (s.id === id ? { ...s, title } : s));
+    setSessions(arr); saveSessions(arr);
+  };
+  const deleteSession = (id) => {
+    const arr = sessions.filter((s) => s.id !== id);
+    setSessions(arr); saveSessions(arr);
+    localStorage.removeItem(STORAGE_KEYS.MESSAGES(id));
+    if (id === sessionId) {
+      const next = arr[0]?.id || uuid();
+      if (!arr[0]) {
+        const ns = { id: next, title: "New chat", createdAt: Date.now() };
+        const arr2 = [ns];
+        setSessions(arr2); saveSessions(arr2); saveChat(next, []);
+      }
+      setSessionId(next);
     }
   };
 
-  const handleThumbClick = (session_id, message_id, thumbs_up, thumbs_down) => {
-    const formdata = new FormData();
-    formdata.append("session_id", session_id);
-    formdata.append("message_id", message_id);
-    formdata.append("thumbs_up", thumbs_up);
-    formdata.append("thumbs_down", thumbs_down);
-    fetch("http://localhost:8000/feedback", { method: "POST", body: formdata });
+  // send
+  const sendMessage = async () => {
+    if (!input.trim() && attachedImages.length === 0) return;
+
+    if (messages.length === 0) renameSession(sessionId, titleFrom(input));
+
+    const userMsg = {
+      id: uuid(),
+      sender: "usuario",
+      text: input,
+      images: attachedImages.map((img) => img.preview),
+    };
+    const pendingId = "pending-" + uuid();
+    const pending = { id: pendingId, sender: "respuesta", text: "", pending: true };
+
+    const optimistic = [...messages, userMsg, pending];
+    setMessages(optimistic);
+    saveChat(sessionId, optimistic);
+
+    const form = new FormData();
+    form.append("message", input);
+    form.append("session_id", sessionId);
+    attachedImages.forEach((img, index) => form.append(`image${index + 1}`, img.file));
+
+    setInput(""); setAttachedImages([]); if (fileInputRef.current) fileInputRef.current.value = "";
+
+    const seq = ++requestSeq.current;
+    try {
+      const resp = await fetch("http://localhost:8000/message", { method: "POST", body: form });
+      const data = await resp.json();
+      if (seq !== requestSeq.current) return;
+
+      const alreadyHasFollowups = /\bSuggested follow-ups?:/i.test(data?.endMessage || "");
+      const textOut = (data?.endMessage || "") + (alreadyHasFollowups ? "" : followups(userMsg.text));
+
+      const rendered = optimistic.map((m) =>
+        m.id === pendingId
+          ? {
+              ...m,
+              pending: false,
+              text: textOut,
+              internal_messages: Array.isArray(data?.messages) ? data.messages : [],
+              mermaidCode: data?.mermaidCode || "",
+              session_id: data?.session_id || sessionId,
+              message_id: data?.message_id
+            }
+          : m
+      );
+      setMessages(rendered);
+      saveChat(sessionId, rendered);
+    } catch (e) {
+      const rendered = optimistic.map((m) =>
+        m.id === pendingId ? { ...m, pending: false, text: "⚠️ Error generating the answer." } : m
+      );
+      setMessages(rendered);
+      saveChat(sessionId, rendered);
+      console.error(e);
+    }
   };
 
-  const handleRating = (sid, mid, isThumbsUp) => {
+  const handleThumbClick = (sid, mid, thumbs_up, thumbs_down) => {
+    const form = new FormData();
+    form.append("session_id", sid);
+    form.append("message_id", mid);
+    form.append("thumbs_up", thumbs_up);
+    form.append("thumbs_down", thumbs_down);
+    fetch("http://localhost:8000/feedback", { method: "POST", body: form });
+  };
+  const handleRating = (sid, mid, isUp) => {
     const key = `${sid}-${mid}`;
     if (ratedMessages.has(key)) return;
     const next = new Set(ratedMessages); next.add(key); setRatedMessages(next);
-    handleThumbClick(sid, mid, isThumbsUp ? 1 : 0, isThumbsUp ? 0 : 1);
+    handleThumbClick(sid, mid, isUp ? 1 : 0, isUp ? 0 : 1);
   };
 
+  // images
   const handleImageUpload = (e) => {
     const files = Array.from(e.target.files);
     if (files.length + attachedImages.length > 2) { alert("Solo puedes adjuntar hasta 2 imágenes."); return; }
-    const newImages = files.map(file => ({ file, preview: URL.createObjectURL(file), name: file.name }));
-    setAttachedImages(prev => [...prev, ...newImages]);
+    const picks = files.map((f) => ({ file: f, preview: URL.createObjectURL(f), name: f.name }));
+    setAttachedImages((p) => [...p, ...picks]);
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
-  const removeImage = (i) => setAttachedImages(prev => prev.filter((_, idx) => idx !== i));
+  const removeImage = (i) => setAttachedImages((p) => p.filter((_, idx) => idx !== i));
 
-  // ——— UI helpers ———
+  // UI helpers
   const bubbleSx = (isUser) => ({
     width: "100%",
     borderRadius: 12,
@@ -155,14 +253,74 @@ export default function Chat() {
     background: isUser ? "rgba(255,255,255,0.06)" : "rgba(255,255,255,0.03)",
     border: "1px solid rgba(255,255,255,0.10)",
     boxShadow: "0 8px 22px rgba(0,0,0,0.28)",
-    position: "relative"
+    position: "relative",
+    color: "#fff",
   });
   const headerSx = { display: "flex", alignItems: "center", justifyContent: "space-between", mb: 1 };
-  const headerTitle = (msg) => msg.sender === "usuario" ? "Tú" : (msg.pending ? "Asistente (pensando…)" : "Asistente");
+  const headerTitle = (msg) => (msg.sender === "usuario" ? "Tú" : msg.pending ? "Asistente (pensando…)" : "Asistente");
+
+  // Drawer UI
+  const DrawerContent = (
+    <Box sx={{ width: 300, height: "100%", background: "#151515", color: "#fff", display: "flex", flexDirection: "column" }}>
+      <Box sx={{ px: 2, py: 1.5, borderBottom: "1px solid rgba(255,255,255,0.08)" }}>
+        <Typography variant="subtitle1" sx={{ color: "#fff", fontWeight: 700 }}>Conversations</Typography>
+      </Box>
+
+      <Box sx={{ flex: 1, overflowY: "auto", py: 1 }}>
+        {sessions.map((s) => (
+          <ListItem key={s.id} disableGutters sx={{
+            px: 1,
+            "&:hover": { background: "rgba(255,255,255,0.06)" },
+            background: s.id === sessionId ? "rgba(3,169,244,0.14)" : "transparent",
+            borderLeft: s.id === sessionId ? "3px solid #03A9F4" : "3px solid transparent",
+          }}>
+            <ListItemButton onClick={() => { setSessionId(s.id); setDrawerOpen(false); }}>
+              <ChatBubbleOutlineIcon sx={{ mr: 1.2, color: "#B3E5FC" }} />
+              <Box sx={{ flex: 1, minWidth: 0 }}>
+                <Typography noWrap sx={{ color: "#fff", fontSize: 14 }}>{s.title || "New chat"}</Typography>
+                <Typography noWrap sx={{ color: "rgba(255,255,255,0.55)", fontSize: 11 }}>
+                  {new Date(s.createdAt).toLocaleString()}
+                </Typography>
+              </Box>
+              <Tooltip title="Rename">
+                <IconButton size="small" onClick={(e) => { e.stopPropagation(); const t = prompt("Rename conversation", s.title || "New chat"); if (t !== null) renameSession(s.id, t.trim() || "New chat"); }} sx={{ color: "rgba(255,255,255,0.8)" }}>
+                  <EditOutlinedIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
+              <Tooltip title="Delete">
+                <IconButton size="small" onClick={(e) => { e.stopPropagation(); if (confirm("Delete this conversation?")) deleteSession(s.id); }} sx={{ color: "rgba(255,255,255,0.8)" }}>
+                  <DeleteOutlineIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
+            </ListItemButton>
+          </ListItem>
+        ))}
+      </Box>
+
+      <Box sx={{ p: 1.2, borderTop: "1px solid rgba(255,255,255,0.08)" }}>
+        <Button
+          fullWidth
+          onClick={createSession}
+          variant="outlined"
+          sx={{ color: "#fff", borderColor: "rgba(255,255,255,0.28)", "&:hover": { borderColor: "#90CAF9", background: "rgba(144,202,249,0.10)" } }}
+        >
+          NEW CHAT
+        </Button>
+      </Box>
+    </Box>
+  );
 
   return (
-    <Box className="chat-container">
-      <Paper className="messages-box">
+    <Box className="chat-root" sx={{ background: "#111", minHeight: "100vh" }}>
+      <Drawer anchor="left" open={drawerOpen} onClose={() => setDrawerOpen(false)} PaperProps={{ sx: { background: "transparent" } }}>
+        {DrawerContent}
+      </Drawer>
+
+      <Paper className="messages-box" sx={{ background: "transparent" }}>
+        <Typography variant="caption" sx={{ color: "#cfcfcf", px: 2, pt: 1, display: "block", opacity: 0.65 }}>
+          session: {sessionId}
+        </Typography>
+
         <List sx={{ px: 2, py: 1 }}>
           {messages.map((msg) => {
             const isUser = msg.sender === "usuario";
@@ -173,43 +331,28 @@ export default function Chat() {
             return (
               <ListItem key={msg.id} disableGutters sx={{ mb: 2 }}>
                 <Box sx={bubbleSx(isUser)}>
-                  {/* Header */}
                   <Box sx={headerSx}>
                     <Typography variant="subtitle2" sx={{ color: "#E8EAF6", fontWeight: 600 }}>
                       {headerTitle(msg)}
                     </Typography>
-
                     {!isUser && (
                       <Stack direction="row" spacing={1} alignItems="center">
-                        {/* Badge RAG si aplica */}
                         {ragSources.length > 0 && (
-                          <Tooltip title={`${ragSources.length} fuente(s) local(es) usadas`}>
+                          <Tooltip title={`${ragSources.length} local source(s)`}>
                             <Chip
                               size="small"
                               icon={<ScienceIcon sx={{ fontSize: 16 }} />}
                               label={`RAG • ${ragSources.length}`}
-                              sx={{
-                                height: 24,
-                                color: "#B3E5FC",
-                                borderColor: "rgba(179,229,252,0.35)",
-                                background: "rgba(3,169,244,0.12)"
-                              }}
+                              sx={{ height: 24, color: "#B3E5FC", borderColor: "rgba(179,229,252,0.35)", background: "rgba(3,169,244,0.12)" }}
                               variant="outlined"
                             />
                           </Tooltip>
                         )}
-
-                        {/* Botón 3 puntos => abre modal con mensajes internos del turno */}
                         {Array.isArray(msg.internal_messages) && msg.internal_messages.length > 0 && (
-                          <Tooltip title="Ver mensajes internos de este turno">
+                          <Tooltip title="View internal messages">
                             <IconButton
                               size="small"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setSelectedInternalMessages(msg.internal_messages);
-                                setSelectedRagSources(ragSources);
-                                setOpenDialog(true);
-                              }}
+                              onClick={(e) => { e.stopPropagation(); setSelectedInternalMessages(msg.internal_messages || []); setSelectedRagSources(ragSources); setOpenDialog(true); }}
                               sx={{ color: "rgba(255,255,255,0.8)", "&:hover": { color: "#90caf9" } }}
                             >
                               <MoreHorizIcon fontSize="small" />
@@ -220,27 +363,23 @@ export default function Chat() {
                     )}
                   </Box>
 
-                  {/* Respuesta */}
                   <Typography variant="body1" sx={{ color: "white", whiteSpace: "pre-wrap", opacity: msg.pending ? 0.75 : 1 }}>
                     {msg.pending ? " " : (msg.text || "")}
                   </Typography>
 
-                  {/* Loader */}
                   {msg.pending && (
                     <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
                       <CircularProgress size={16} />
-                      <Typography variant="caption" sx={{ color: "#CFD8DC" }}>generando respuesta…</Typography>
+                      <Typography variant="caption" sx={{ color: "#CFD8DC" }}>generating response…</Typography>
                     </Box>
                   )}
 
-                  {/* Mermaid */}
                   {msg.mermaidCode && (
                     <Box sx={{ mt: 2 }}>
                       <MermaidChart chart={msg.mermaidCode} />
                     </Box>
                   )}
 
-                  {/* Imágenes del usuario */}
                   {msg.images?.length > 0 && (
                     <Box className="image-container" sx={{ mt: 1 }}>
                       {msg.images.map((src, i) => (
@@ -249,12 +388,10 @@ export default function Chat() {
                     </Box>
                   )}
 
-                  {/* Separador si hay extras */}
                   {!isUser && (roles.length > 0 || (msg.session_id && msg.message_id)) && (
                     <Divider sx={{ my: 1.2, opacity: 0.08 }} />
                   )}
 
-                  {/* Chips de roles (sin duplicados) */}
                   {!isUser && roles.length > 0 && (
                     <Stack direction="row" spacing={1} sx={{ flexWrap: "wrap" }}>
                       {roles.map(([name, count]) => (
@@ -263,37 +400,23 @@ export default function Chat() {
                           label={`${name}${count > 1 ? ` ×${count}` : ""}`}
                           size="small"
                           variant="outlined"
-                          sx={{
-                            borderColor: "rgba(255,255,255,0.22)",
-                            color: "rgba(255,255,255,0.9)",
-                            background: "rgba(255,255,255,0.05)",
-                            height: 24
-                          }}
+                          sx={{ borderColor: "rgba(255,255,255,0.22)", color: "rgba(255,255,255,0.9)", background: "rgba(255,255,255,0.05)", height: 24 }}
                         />
                       ))}
                     </Stack>
                   )}
 
-                  {/* Rating */}
                   {!isUser && msg.session_id && msg.message_id && (
                     <Box sx={{ display: "flex", justifyContent: "flex-end", mt: 1, opacity: ratedMessages.has(ratedKey) ? 0.5 : 1 }}>
                       <Typography variant="caption" sx={{ color: "rgba(255,255,255,0.75)", mr: 1, alignSelf: "center" }}>
-                        ¿Fue útil esta respuesta?
+                        Was this helpful?
                       </Typography>
-                      <IconButton
-                        size="small"
-                        onClick={(e) => { e.stopPropagation(); handleRating(msg.session_id, msg.message_id, true); }}
-                        disabled={ratedMessages.has(ratedKey)}
-                        sx={{ color: "rgba(255,255,255,0.75)", "&:hover": { color: "#4caf50" } }}
-                      >
+                      <IconButton size="small" onClick={(e) => { e.stopPropagation(); handleRating(msg.session_id, msg.message_id, true); }}
+                        disabled={ratedMessages.has(ratedKey)} sx={{ color: "rgba(255,255,255,0.75)", "&:hover": { color: "#4caf50" } }}>
                         <ThumbUpIcon fontSize="small" />
                       </IconButton>
-                      <IconButton
-                        size="small"
-                        onClick={(e) => { e.stopPropagation(); handleRating(msg.session_id, msg.message_id, false); }}
-                        disabled={ratedMessages.has(ratedKey)}
-                        sx={{ color: "rgba(255,255,255,0.75)", "&:hover": { color: "#f44336" } }}
-                      >
+                      <IconButton size="small" onClick={(e) => { e.stopPropagation(); handleRating(msg.session_id, msg.message_id, false); }}
+                        disabled={ratedMessages.has(ratedKey)} sx={{ color: "rgba(255,255,255,0.75)", "&:hover": { color: "#f44336" } }}>
                         <ThumbDownIcon fontSize="small" />
                       </IconButton>
                     </Box>
@@ -305,7 +428,6 @@ export default function Chat() {
         </List>
       </Paper>
 
-      {/* Chips de imágenes */}
       {attachedImages.length > 0 && (
         <Stack direction="row" spacing={1} sx={{ mt: 2, mb: 2, ml: 1 }}>
           {attachedImages.map((img, index) => (
@@ -320,7 +442,6 @@ export default function Chat() {
         </Stack>
       )}
 
-      {/* Input */}
       <Box className="input-container">
         <TextField
           className="input-field"
@@ -332,60 +453,48 @@ export default function Chat() {
           onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && sendMessage()}
           InputProps={{
             endAdornment: (
-              <IconButton className="attach-button" onClick={() => fileInputRef.current?.click()} disabled={attachedImages.length >= 2}>
+              <IconButton onClick={() => fileInputRef.current?.click()} disabled={attachedImages.length >= 2} sx={{ color: "#fff" }}>
                 <Badge badgeContent={attachedImages.length} color="primary">
                   <AttachFileIcon />
                 </Badge>
               </IconButton>
-            )
+            ),
           }}
+          sx={{ "& .MuiInputBase-root": { background: "#1d1d1d", color: "#fff", borderRadius: 1 } }}
         />
         <input type="file" multiple accept="image/*" ref={fileInputRef} onChange={handleImageUpload} style={{ display: "none" }} />
         <Button className="send-button" variant="contained" onClick={sendMessage}>ENVIAR</Button>
       </Box>
 
-      {/* Modal: mensajes internos + fuentes RAG */}
       <Dialog
         className="nodes-dialog"
         open={openDialog}
         onClose={() => setOpenDialog(false)}
         fullWidth
         maxWidth="md"
-        PaperProps={{
-          sx: {
-            background: "rgba(17,17,17,0.96)",
-            border: "1px solid rgba(255,255,255,0.08)",
-            boxShadow: "0 20px 60px rgba(0,0,0,0.5)"
-          }
-        }}
+        PaperProps={{ sx: { background: "rgba(17,17,17,0.96)", border: "1px solid rgba(255,255,255,0.08)", boxShadow: "0 20px 60px rgba(0,0,0,0.5)" } }}
       >
-        <DialogTitle sx={{ pr: 6 }}>
+        <DialogTitle sx={{ pr: 6, color: "#fff" }}>
           Mensajes Internos (turno actual)
-          <IconButton aria-label="close" onClick={() => setOpenDialog(false)} sx={{ position: "absolute", right: 8, top: 8 }}>
+          <IconButton aria-label="close" onClick={() => setOpenDialog(false)} sx={{ position: "absolute", right: 8, top: 8, color: "#fff" }}>
             <CloseIcon />
           </IconButton>
         </DialogTitle>
         <DialogContent dividers sx={{ borderColor: "rgba(255,255,255,0.08)" }}>
-          {/* Fuentes RAG si hubo */}
           {selectedRagSources.length > 0 && (
             <Box sx={{ mb: 2, p: 1.2, border: "1px dashed rgba(179,229,252,0.35)", borderRadius: 1.5, background: "rgba(3,169,244,0.06)" }}>
               <Typography variant="subtitle2" sx={{ color: "#B3E5FC", display: "flex", alignItems: "center", gap: 1 }}>
-                <ScienceIcon fontSize="small" /> Fuentes locales usadas
+                <ScienceIcon fontSize="small" /> Local sources
               </Typography>
               <List dense sx={{ mt: 0.5 }}>
                 {selectedRagSources.map((s, i) => (
                   <ListItem key={`src-${i}`} sx={{ py: 0 }}>
-                    <ListItemText
-                      primary={`• ${s}`}
-                      primaryTypographyProps={{ color: "white", fontSize: 13 }}
-                    />
+                    <ListItemText primary={`• ${s}`} primaryTypographyProps={{ color: "white", fontSize: 13 }} />
                   </ListItem>
                 ))}
               </List>
             </Box>
           )}
-
-          {/* Conversación interna */}
           <List dense>
             {selectedInternalMessages.map((m, i) => (
               <ListItem key={`internal-${i}`} sx={{ alignItems: "flex-start" }}>
