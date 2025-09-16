@@ -17,7 +17,7 @@ import ChatBubbleOutlineIcon from "@mui/icons-material/ChatBubbleOutline";
 import ScienceIcon from "@mui/icons-material/Science";
 import "../styles/chat.css";
 
-// ------------ Utils
+/* ======================= Utils ======================= */
 const uuid = () =>
   (crypto?.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random()));
 
@@ -26,41 +26,14 @@ const STORAGE_KEYS = {
   MESSAGES: (sid) => `arquia.chat.${sid}`,
 };
 
+const DISCLAIMER =
+  "ArquIA es un asistente para arquitectas y arquitectos de software: acelera análisis, tácticas y diagramas. Puede cometer errores; verifica siempre la información importante.";
+
 const titleFrom = (text) => {
   const t = (text || "").trim();
   if (!t) return "New chat";
   const firstLine = t.split("\n")[0].slice(0, 60);
   return firstLine || "New chat";
-};
-
-// Fallback follow-ups (English)
-const followups = (userText) => {
-  const t = (userText || "").toLowerCase();
-  const base = [
-    "Want a component diagram for this?",
-    "See common scalability tactics?",
-    "Do you want an ASR example?",
-    "Would you like a deployment view?",
-    "Should I propose trade-offs and risks?"
-  ];
-  const lat = [
-    "Drill into latency root-cause patterns?",
-    "Show a checklist to reduce response time?"
-  ];
-  const sca = [
-    "Compare horizontal vs vertical scaling?",
-    "See partitioning and replication options?"
-  ];
-  const add = [
-    "Walk through ADD 3.0 steps?",
-    "Map drivers → QAs → tactics for your case?"
-  ];
-  let extra = [];
-  if (/\blatenc/i.test(t)) extra = lat;
-  if (/\bscalab|scale|throughput/i.test(t)) extra = extra.concat(sca);
-  if (/\badd\b|attribute driven/i.test(t)) extra = extra.concat(add);
-  const unique = [...new Set([...extra, ...base])].slice(0, 5);
-  return `\n\n---\n**Suggested follow-ups:**\n- ${unique.join("\n- ")}`;
 };
 
 // storage helpers
@@ -73,6 +46,50 @@ const loadChat = (sid) => {
 };
 const saveChat = (sid, msgs) => localStorage.setItem(STORAGE_KEYS.MESSAGES(sid), JSON.stringify(msgs));
 
+/* Parse “Next:” fallback si el backend no envía suggestions[] */
+const parseNextFromText = (text = "") => {
+  const m = text.match(/^\s*Next:\s*([\s\S]*)$/im);
+  if (!m) return [];
+  const lines = m[1]
+    .split("\n")
+    .map((ln) => ln.replace(/^[\s\-•]+/, "").trim())
+    .filter(Boolean);
+  // corta en el primer bloque vacío
+  const cleaned = [];
+  for (const ln of lines) {
+    if (!ln) break;
+    cleaned.push(ln);
+    if (cleaned.length >= 8) break;
+  }
+  return cleaned;
+};
+
+/* RAG helpers para el modal */
+const summarizeRoles = (internal = []) => {
+  const counts = new Map();
+  const order = ["supervisor", "researcher", "evaluator", "creator", "asr_recommender", "unifier"];
+  internal.forEach((m) => {
+    const k = (m.name || m.role || "other").toLowerCase();
+    counts.set(k, (counts.get(k) || 0) + 1);
+  });
+  const ordered = order.filter(k => counts.has(k)).map(k => [k, counts.get(k)]);
+  const rest = [...counts.entries()].filter(([k]) => !order.includes(k));
+  return [...ordered, ...rest];
+};
+const extractRagSources = (internal = []) => {
+  const out = [];
+  for (const m of internal) {
+    const text = String(m.content || "");
+    const idx = text.indexOf("\nSOURCES:\n");
+    if (idx !== -1) {
+      const lines = text.substring(idx + "\nSOURCES:\n".length).split("\n");
+      for (const ln of lines) { const t = ln.trim(); if (t.startsWith("- ")) out.push(t.slice(2)); }
+    }
+  }
+  return out;
+};
+
+/* ======================= Chat ======================= */
 export default function Chat() {
   // Drawer (escucha al header global)
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -97,6 +114,9 @@ export default function Chat() {
   const fileInputRef = useRef(null);
   const requestSeq = useRef(0);
 
+  // ¿hay respuesta pendiente? -> bloquea UI
+  const isBusy = useMemo(() => messages.some((m) => m.pending), [messages]);
+
   useEffect(() => {
     if (sessions.length === 0) {
       const first = { id: sessionId, title: "New chat", createdAt: Date.now() };
@@ -109,33 +129,9 @@ export default function Chat() {
 
   useEffect(() => { setMessages(loadChat(sessionId)); }, [sessionId]);
 
-  // RAG parse helpers
-  const summarizeRoles = (internal = []) => {
-    const counts = new Map();
-    const order = ["supervisor_prompt","supervisor_decision","researcher","evaluator","creator","asr","small_talk"];
-    internal.forEach((m) => {
-      const k = (m.name || m.role || "other").toLowerCase();
-      counts.set(k, (counts.get(k) || 0) + 1);
-    });
-    const ordered = order.filter(k => counts.has(k)).map(k => [k, counts.get(k)]);
-    const rest = [...counts.entries()].filter(([k]) => !order.includes(k));
-    return [...ordered, ...rest];
-  };
-  const extractRagSources = (internal = []) => {
-    const out = [];
-    for (const m of internal) {
-      const text = String(m.content || "");
-      const idx = text.indexOf("\nSOURCES:\n");
-      if (idx !== -1) {
-        const lines = text.substring(idx + "\nSOURCES:\n".length).split("\n");
-        for (const ln of lines) { const t = ln.trim(); if (t.startsWith("- ")) out.push(t.slice(2)); }
-      }
-    }
-    return out;
-  };
-
   // sessions ops
   const createSession = () => {
+    if (isBusy) return;
     const id = uuid();
     const s = { id, title: "New chat", createdAt: Date.now() };
     const arr = [s, ...sessions];
@@ -146,6 +142,7 @@ export default function Chat() {
     setSessions(arr); saveSessions(arr);
   };
   const deleteSession = (id) => {
+    if (isBusy) return;
     const arr = sessions.filter((s) => s.id !== id);
     setSessions(arr); saveSessions(arr);
     localStorage.removeItem(STORAGE_KEYS.MESSAGES(id));
@@ -160,16 +157,19 @@ export default function Chat() {
     }
   };
 
-  // send
-  const sendMessage = async () => {
-    if (!input.trim() && attachedImages.length === 0) return;
+  // ------- envío ----------
+  const sendMessage = async (overrideText) => {
+    if (isBusy) return; // bloquear envío cuando está “pensando”
 
-    if (messages.length === 0) renameSession(sessionId, titleFrom(input));
+    const textToSend = (overrideText ?? input).trim();
+    if (!textToSend && attachedImages.length === 0) return;
+
+    if (messages.length === 0) renameSession(sessionId, titleFrom(textToSend));
 
     const userMsg = {
       id: uuid(),
       sender: "usuario",
-      text: input,
+      text: textToSend,
       images: attachedImages.map((img) => img.preview),
     };
     const pendingId = "pending-" + uuid();
@@ -180,11 +180,14 @@ export default function Chat() {
     saveChat(sessionId, optimistic);
 
     const form = new FormData();
-    form.append("message", input);
+    form.append("message", textToSend);
     form.append("session_id", sessionId);
     attachedImages.forEach((img, index) => form.append(`image${index + 1}`, img.file));
 
-    setInput(""); setAttachedImages([]); if (fileInputRef.current) fileInputRef.current.value = "";
+    // limpiar input/adjuntos
+    setInput("");
+    setAttachedImages([]);
+    if (fileInputRef.current) fileInputRef.current.value = "";
 
     const seq = ++requestSeq.current;
     try {
@@ -192,8 +195,8 @@ export default function Chat() {
       const data = await resp.json();
       if (seq !== requestSeq.current) return;
 
-      const alreadyHasFollowups = /\bSuggested follow-ups?:/i.test(data?.endMessage || "");
-      const textOut = (data?.endMessage || "") + (alreadyHasFollowups ? "" : followups(userMsg.text));
+      // usamos texto tal cual del backend (Answer/References/Next)
+      const textOut = data?.endMessage || "—";
 
       const rendered = optimistic.map((m) =>
         m.id === pendingId
@@ -204,7 +207,10 @@ export default function Chat() {
               internal_messages: Array.isArray(data?.messages) ? data.messages : [],
               mermaidCode: data?.mermaidCode || "",
               session_id: data?.session_id || sessionId,
-              message_id: data?.message_id
+              message_id: data?.message_id,
+              suggestions: Array.isArray(data?.suggestions) && data.suggestions.length > 0
+                ? data.suggestions
+                : parseNextFromText(textOut) // fallback si no vino el array
             }
           : m
       );
@@ -220,6 +226,13 @@ export default function Chat() {
     }
   };
 
+  // chips -> manda la sugerencia como prompt
+  const onSuggestionClick = (sugg) => {
+    if (isBusy) return;
+    sendMessage(sugg);
+  };
+
+  // feedback
   const handleThumbClick = (sid, mid, thumbs_up, thumbs_down) => {
     const form = new FormData();
     form.append("session_id", sid);
@@ -237,15 +250,16 @@ export default function Chat() {
 
   // images
   const handleImageUpload = (e) => {
+    if (isBusy) return;
     const files = Array.from(e.target.files);
     if (files.length + attachedImages.length > 2) { alert("Solo puedes adjuntar hasta 2 imágenes."); return; }
     const picks = files.map((f) => ({ file: f, preview: URL.createObjectURL(f), name: f.name }));
     setAttachedImages((p) => [...p, ...picks]);
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
-  const removeImage = (i) => setAttachedImages((p) => p.filter((_, idx) => idx !== i));
+  const removeImage = (i) => { if (!isBusy) setAttachedImages((p) => p.filter((_, idx) => idx !== i)); };
 
-  // UI helpers
+  /* ======================= UI ======================= */
   const bubbleSx = (isUser) => ({
     width: "100%",
     borderRadius: 12,
@@ -274,7 +288,7 @@ export default function Chat() {
             background: s.id === sessionId ? "rgba(3,169,244,0.14)" : "transparent",
             borderLeft: s.id === sessionId ? "3px solid #03A9F4" : "3px solid transparent",
           }}>
-            <ListItemButton onClick={() => { setSessionId(s.id); setDrawerOpen(false); }}>
+            <ListItemButton onClick={() => { if (!isBusy) { setSessionId(s.id); setDrawerOpen(false); } }}>
               <ChatBubbleOutlineIcon sx={{ mr: 1.2, color: "#B3E5FC" }} />
               <Box sx={{ flex: 1, minWidth: 0 }}>
                 <Typography noWrap sx={{ color: "#fff", fontSize: 14 }}>{s.title || "New chat"}</Typography>
@@ -283,7 +297,11 @@ export default function Chat() {
                 </Typography>
               </Box>
               <Tooltip title="Rename">
-                <IconButton size="small" onClick={(e) => { e.stopPropagation(); const t = prompt("Rename conversation", s.title || "New chat"); if (t !== null) renameSession(s.id, t.trim() || "New chat"); }} sx={{ color: "rgba(255,255,255,0.8)" }}>
+                <IconButton size="small" onClick={(e) => {
+                  e.stopPropagation();
+                  const t = prompt("Rename conversation", s.title || "New chat");
+                  if (t !== null) renameSession(s.id, t.trim() || "New chat");
+                }} sx={{ color: "rgba(255,255,255,0.8)" }}>
                   <EditOutlinedIcon fontSize="small" />
                 </IconButton>
               </Tooltip>
@@ -301,6 +319,7 @@ export default function Chat() {
         <Button
           fullWidth
           onClick={createSession}
+          disabled={isBusy}
           variant="outlined"
           sx={{ color: "#fff", borderColor: "rgba(255,255,255,0.28)", "&:hover": { borderColor: "#90CAF9", background: "rgba(144,202,249,0.10)" } }}
         >
@@ -370,7 +389,7 @@ export default function Chat() {
                   {msg.pending && (
                     <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
                       <CircularProgress size={16} />
-                      <Typography variant="caption" sx={{ color: "#CFD8DC" }}>generating response…</Typography>
+                      <Typography variant="caption" sx={{ color: "##CFD8DC" }}>generating response…</Typography>
                     </Box>
                   )}
 
@@ -388,6 +407,32 @@ export default function Chat() {
                     </Box>
                   )}
 
+                  {/* Chips “Next” */}
+                  {!isUser && Array.isArray(msg.suggestions) && msg.suggestions.length > 0 && (
+                    <>
+                      <Divider sx={{ my: 1.2, opacity: 0.08 }} />
+                      <Stack direction="row" spacing={1} sx={{ flexWrap: "wrap" }}>
+                        {msg.suggestions.map((s, i) => (
+                          <Chip
+                            key={`${msg.id}-sugg-${i}`}
+                            label={s}
+                            onClick={() => onSuggestionClick(s)}
+                            disabled={isBusy}
+                            size="small"
+                            sx={{
+                              borderColor: "rgba(3,169,244,0.35)",
+                              color: "#B3E5FC",
+                              background: "rgba(3,169,244,0.10)",
+                              height: 26
+                            }}
+                            variant="outlined"
+                          />
+                        ))}
+                      </Stack>
+                    </>
+                  )}
+
+                  {/* Roles y rating */}
                   {!isUser && (roles.length > 0 || (msg.session_id && msg.message_id)) && (
                     <Divider sx={{ my: 1.2, opacity: 0.08 }} />
                   )}
@@ -442,18 +487,20 @@ export default function Chat() {
         </Stack>
       )}
 
+      {/* Input + acciones */}
       <Box className="input-container">
         <TextField
           className="input-field"
           fullWidth
           variant="outlined"
-          placeholder="Escribe un mensaje..."
+          placeholder={isBusy ? "Esperando respuesta…" : "Escribe un mensaje..."}
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && sendMessage()}
+          onKeyDown={(e) => { if (!isBusy && e.key === "Enter" && !e.shiftKey) sendMessage(); }}
+          disabled={isBusy}
           InputProps={{
             endAdornment: (
-              <IconButton onClick={() => fileInputRef.current?.click()} disabled={attachedImages.length >= 2} sx={{ color: "#fff" }}>
+              <IconButton onClick={() => !isBusy && fileInputRef.current?.click()} disabled={attachedImages.length >= 2 || isBusy} sx={{ color: "#fff" }}>
                 <Badge badgeContent={attachedImages.length} color="primary">
                   <AttachFileIcon />
                 </Badge>
@@ -463,9 +510,12 @@ export default function Chat() {
           sx={{ "& .MuiInputBase-root": { background: "#1d1d1d", color: "#fff", borderRadius: 1 } }}
         />
         <input type="file" multiple accept="image/*" ref={fileInputRef} onChange={handleImageUpload} style={{ display: "none" }} />
-        <Button className="send-button" variant="contained" onClick={sendMessage}>ENVIAR</Button>
+        <Button className="send-button" variant="contained" onClick={() => sendMessage()} disabled={isBusy}>
+          {isBusy ? "ENVIANDO..." : "ENVIAR"}
+        </Button>
       </Box>
 
+      {/* Modal: mensajes internos */}
       <Dialog
         className="nodes-dialog"
         open={openDialog}
@@ -509,6 +559,23 @@ export default function Chat() {
           </List>
         </DialogContent>
       </Dialog>
+            <Box
+        component="footer"
+        sx={{
+          px: 2,
+          py: 1.5,
+          textAlign: "center",
+          color: "rgba(255,255,255,0.65)",
+          fontSize: 12,
+          borderTop: "1px dashed rgba(255,255,255,0.12)",
+          maxWidth: 980,
+          mx: "auto",
+          mt: 1.5,
+        }}
+      >
+        {DISCLAIMER}
+      </Box>
+
     </Box>
   );
 }

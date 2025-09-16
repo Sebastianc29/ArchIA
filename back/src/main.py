@@ -94,6 +94,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Helpers
+def _normalize_topic(xx: str) -> str:
+    x = (xx or "").lower()
+    if "latenc" in x or "latencia" in x: return "latency"
+    if "scalab" in x or "escalabilidad" in x: return "scalability"
+    if "availab" in x or "disponibilidad" in x: return "availability"
+    if "perform" in x or "rendim" in x: return "performance"
+    return ""
+
+def _extract_topic_from_text(q: str) -> str:
+    return _normalize_topic(q)
+
+def _needs_topic_hint(q: str) -> bool:
+    low = (q or "").lower()
+    mentions_tactics = bool(re.search(r"\btactic|\btáctic|\btactica|\btáctica", low))
+    has_topic = bool(_extract_topic_from_text(low))
+    return mentions_tactics and not has_topic
+
 # ===================== Health ===========================
 @app.get("/")
 def root():
@@ -117,10 +135,13 @@ async def message(
     if not session_id:
         raise HTTPException(status_code=400, detail="No session ID provided")
 
+    # Identidad simple por sesión
     user_id = request.headers.get("X-User-Id") or session_id
+
+    # ID incremental para feedback por mensaje
     message_id = get_next_message_id(session_id)
 
-    # --- imágenes opcionales ---
+    # --- Manejo de imágenes (opcionales) ---
     image_path1 = ""
     if image1 and image1.filename:
         dest1 = IMAGES_DIR / image1.filename
@@ -135,36 +156,66 @@ async def message(
             f.write(await image2.read())
         image_path2 = str(dest2)
 
-    # --- mensajes base para el grafo ---
+    # --- Mensajes base para el grafo ---
     messageList = [{"role": "user", "content": message}]
     if image_path1:
         messageList.append({"role": "user", "content": "this is the image path: " + image_path1})
     if image_path2:
         messageList.append({"role": "user", "content": "this is the second image path: " + image_path2})
 
-    # --- memoria previa ---
+    # --- Memoria previa para continuidad de conversación ---
     last_topic = memory_get(user_id, "topic", "")
     asr_notes  = memory_get(user_id, "asr_notes", "")
     memory_text = f"Tema previo: {last_topic}. ASR previas: {asr_notes}".strip() or "N/A"
 
+    # --- Config del hilo LangGraph ---
     config = {"configurable": {"thread_id": str(session_id)}}
     user_lang = detect_lang(message)
 
-    # limpia estado residual si existe
+    # --- Heurísticas locales para topic_hint y force_rag ---
+    def _normalize_topic(xx: str) -> str:
+        x = (xx or "").lower()
+        if "latenc" in x or "latencia" in x: return "latency"
+        if "scalab" in x or "escalabilidad" in x: return "scalability"
+        if "availab" in x or "disponibilidad" in x: return "availability"
+        if "perform" in x or "rendim" in x: return "performance"
+        return ""
+
+    def _extract_topic_from_text(q: str) -> str:
+        return _normalize_topic(q)
+
+    def _needs_topic_hint(q: str) -> bool:
+        low = (q or "").lower()
+        mentions_tactics = bool(re.search(r"\btactic|\btáctic|\btactica|\btáctica", low))
+        has_topic = bool(_extract_topic_from_text(low))
+        return mentions_tactics and not has_topic
+
+    topic_hint = _extract_topic_from_text(message) or _extract_topic_from_text(last_topic)
+
+    msg_low = message.lower()
+    force_rag = (
+        _needs_topic_hint(message) or
+        bool(re.search(
+            r"\b(add|qas|asr|tactic|táctica|latenc|scalab|throughput|rendim|availability|disponib|diagrama|diagram)\b",
+            msg_low
+        ))
+    )
+
+    # --- Limpia estado residual del hilo (por si quedó algo del turno anterior) ---
     try:
         state = graph.get_state(config)
         if state:
             graph.update_state(config, {"endMessage": "", "mermaidCode": ""})
     except Exception:
+        # no es crítico si falla
         pass
 
-    # --- invocación grafo ---
+    # --- Invocación del grafo ---
     try:
         result = graph.invoke(
             {
                 "messages": messageList,
                 "userQuestion": message,
-                "userLang": user_lang,
                 "localQuestion": "",
                 "hasVisitedInvestigator": False,
                 "hasVisitedCreator": False,
@@ -181,30 +232,34 @@ async def message(
                 "suggestions": [],
                 "language": user_lang,
                 "intent": "general",
-                "force_rag": False,
+                "force_rag": force_rag,
+                "topic_hint": topic_hint,  # si tu GraphState no lo tiene, puedes quitar esta línea
             },
             config,
         )
     except Exception as e:
+        # Imprime traza completa en consola para depurar rápidamente
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Graph error: {e}")
 
-    # feedback inicial
+    # --- Feedback inicial para este mensaje ---
     upsert_feedback(session_id=session_id, message_id=message_id, up=0, down=0)
 
-    # memoria simple (tema/ASR)
+    # --- Actualiza memoria simple por palabras clave ---
     low = message.lower()
     if "latencia" in low:
         memory_set(user_id, "topic", "latencia")
     elif "escalabilidad" in low:
         memory_set(user_id, "topic", "escalabilidad")
-    if "asr" in message.lower():
+    if "asr" in low:
         memory_set(user_id, "asr_notes", message)
 
-    # payload del turno actual
+    # --- Payload del turno actual (lo que consume el front) ---
     clean_payload = {
         "endMessage": result.get("endMessage", ""),
         "mermaidCode": result.get("mermaidCode", ""),
-        "messages": result.get("turn_messages", []),
+        "messages": result.get("turn_messages", []),  # solo los internos de este turno
         "session_id": session_id,
         "message_id": message_id,
         "suggestions": result.get("suggestions", []),

@@ -612,6 +612,9 @@ def evaluator_node(state: GraphState) -> GraphState:
     }
 
 # --- Unifier ---
+# ===== Unifier (compact answer) =====
+import re
+from langchain_core.messages import AIMessage
 
 def _last_ai_by(state, name: str) -> str:
     for m in reversed(state["messages"]):
@@ -619,111 +622,153 @@ def _last_ai_by(state, name: str) -> str:
             return m.content
     return ""
 
-def _strip_markdown_and_diagrams(text: str) -> str:
-    text = re.sub(r"```.*?```", "", text, flags=re.S)   # cualquier fence
-    text = re.sub(r"^\s*#.*$", "", text, flags=re.M)    # titulos
+def _strip_all_markdown(text: str) -> str:
+    # sin fences / markdown / mermaid
+    text = re.sub(r"```.*?```", "", text, flags=re.S)
+    text = re.sub(r"^\s*#.*$", "", text, flags=re.M)
     text = text.replace("**", "")
-    # quitar líneas típicas de mermaid
+    # quita líneas típicas de mermaid
     out = []
     for ln in text.splitlines():
         if re.search(r"^\s*(graph\s+(LR|TB)|flowchart|sequenceDiagram|classDiagram)\b", ln, re.I):
             continue
-        if re.match(r"^\s*[A-Za-z0-9_-]+\s*--?[>-]", ln):  # edges
+        if re.match(r"^\s*[A-Za-z0-9_-]+\s*--?[>-]", ln):
             continue
         out.append(ln)
     return "\n".join(out).strip()
+
+def _extract_rag_sources_from(text: str) -> str:
+    """Lee el bloque 'SOURCES:' de la salida del researcher (local_RAG)."""
+    m = re.search(r"SOURCES:\s*(.+)$", text, flags=re.S | re.I)
+    if not m:
+        return ""
+    raw = m.group(1)
+    lines = []
+    for ln in raw.splitlines():
+        ln = ln.strip(" -\t")
+        if ln:
+            lines.append(ln)
+    # limita un poco
+    return "\n".join(lines[:8])
+
+def _split_sections(text: str) -> dict:
+    """Divide por encabezados 'Answer:', 'References:', 'Next:' para extraer chips."""
+    sections = {"Answer": "", "References": "", "Next": ""}
+    current = None
+    for ln in text.splitlines():
+        if re.match(r"^Answer:", ln, re.I):
+            current = "Answer"; sections[current] = ln.split(":", 1)[1].strip(); continue
+        if re.match(r"^References:", ln, re.I):
+            current = "References"; sections[current] = ln.split(":", 1)[1].strip(); continue
+        if re.match(r"^Next:", ln, re.I):
+            current = "Next"; sections[current] = ln.split(":", 1)[1].strip(); continue
+        if current:
+            sections[current] += ("\n" + ln)
+    for k in sections:
+        sections[k] = sections[k].strip()
+    return sections
 
 def unifier_node(state: GraphState) -> GraphState:
     lang = state.get("language", "es")
     intent = state.get("intent", "general")
 
-    # Si viene de ASR, solo adjuntamos y proponemos follow-ups
+    # 1) Caso especial: ASR -> entrega tal cual (ya te funcionaba bien)
     if intent == "asr":
-        last_asr = _last_ai_by(state, "asr_recommender") or "No ASR content found for this turn."
+        last_asr = ""
+        for m in reversed(state.get("messages", [])):
+            if isinstance(m, AIMessage) and (m.name or "") == "asr_recommender" and m.content:
+                last_asr = m.content
+                break
+        if not last_asr:
+            last_asr = "No ASR content found for this turn."
         followups = [
-            "Want a component diagram for this?",
-            "See a Functional view next?",
-            "Check a Deployment view and hosting options?",
-            "Compare scalability vs. latency tactics?",
-            "Would you like an example ASR for this case?",
-            "Map quality drivers → tactics for your context?",
-            "Do you want architectural styles to consider?",
+            "¿Quieres un diagrama de componentes para este ASR?" if lang=="es" else "Want a component diagram for this?",
+            "¿Validamos el despliegue y hosting?" if lang=="es" else "Check a Deployment view and hosting options?",
+            "¿Comparamos latencia vs. escalabilidad?" if lang=="es" else "Compare latency vs. scalability?",
         ]
-        end_text = last_asr + "\n\nSuggested follow-ups (English):\n- " + "\n- ".join(followups)
+        end_text = f"{last_asr}\n\nNext:\n- " + "\n- ".join(followups)
         state["turn_messages"] = state.get("turn_messages", []) + [
             {"role": "assistant", "name": "unifier", "content": end_text}
         ]
-        return {**state, "endMessage": end_text, "suggestions": followups}
+        # chips
+        state["suggestions"] = followups
+        return {**state, "endMessage": end_text}
 
-    # Mezcla de fuentes
+    # 2) Caso especial: saludo / smalltalk -> respuesta corta, sin plantilla
+    if intent in ("greeting", "smalltalk"):
+        hello = "¡Hola! ¿Sobre qué tema de arquitectura quieres profundizar?" if lang=="es" \
+                else "Hi! What software-architecture topic would you like to explore?"
+        nexts = [
+            "Latency tactics vs scalability?",
+            "Create a deployment view for my web app?",
+            "Give me a scalability ASR example?",
+            "Compare event-driven vs request/response?",
+        ]
+        end_text = hello + "\n\nNext:\n- " + "\n- ".join(nexts)
+        state["suggestions"] = nexts
+        return {**state, "endMessage": end_text}
+
+    # 3) Modo compacto por defecto (respuesta + referencias + siguientes pasos)
+    #    Prepara SOURCE y posibles referencias del RAG
+    researcher_txt = _last_ai_by(state, "researcher")
+    evaluator_txt  = _last_ai_by(state, "evaluator")
+    creator_txt    = _last_ai_by(state, "creator")
+
+    rag_refs = _extract_rag_sources_from(researcher_txt) if researcher_txt else ""
+    memory_hint = state.get("memory_text", "")
+
     buckets = []
-    for agent_name in ["researcher", "evaluator", "asr_evaluator", "asr_recommender", "creator"]:
-        if agent_name == "creator" and intent != "diagram":
-            continue
-        c = _last_ai_by(state, agent_name)
-        if c:
-            buckets.append(f"{agent_name} says:\n{c}")
+    if researcher_txt: buckets.append(f"researcher:\n{researcher_txt}")
+    if evaluator_txt:  buckets.append(f"evaluator:\n{evaluator_txt}")
+    if creator_txt and intent == "diagram": buckets.append(f"creator:\n{creator_txt}")
 
     synthesis_source = "User question:\n" + (state.get("userQuestion","")) + "\n\n" + "\n\n".join(buckets)
 
-    seed = [
-        "Want a component diagram for this?",
-        "See a Functional view next?",
-        "Check a Deployment view and hosting options?",
-        "Compare scalability vs. latency tactics?",
-        "Would you like an example ASR for this case?",
-        "Map quality drivers → tactics for your context?",
-        "Do you want architectural styles to consider?",
-    ]
-
-    directive = "Answer in English." if lang == "en" else "Responde en español."
+    directive = "Responde en español." if lang=="es" else "Answer in English."
     prompt = f"""{directive}
-Write a compact but complete synthesis using ONLY the SOURCE. Plain text only (no Markdown, no code fences, no mermaid).
+You are writing the FINAL chat reply. Produce **compact output** with three sections ONLY and no Markdown headers:
 
-Format and labels EXACTLY:
+Answer:
+- Give a complete, direct solution tailored to the question and context.
+- 6–12 concise lines (bullets or short sentences). No code fences, no mermaid.
 
-Summary:
-  2–4 concise lines tailored to the question.
+References:
+- If RAG_SOURCES has entries, list 3–6 relevant items (short, one per line). If empty, write "None".
 
-Development:
-  - 5–10 bullets or short paragraphs with concrete, actionable details from SOURCE.
+Next:
+- 3–5 short, context-aware follow-up questions to continue THIS conversation.
 
-Decisions & trade-offs:
-  - 3–6 bullets with explicit trade-offs and when/when-not.
+Constraints:
+- Use the user's language for all sections.
+- Do not invent sources outside RAG_SOURCES.
+- Keep it clean: no '#', no '**', no code blocks.
 
-Checklist:
-  - 4–8 short, testable items.
+Conversation memory (for continuity): {memory_hint}
 
-Citations:
-  - If SOURCE referenced identifiable documents, list them as: <title> (p.X) — <short path or id>.
+RAG_SOURCES:
+{rag_refs}
 
-Suggested follow-ups (English):
-  - 5–8 one-line questions practitioners often ask next, choose from or adapt:
-    {", ".join(seed)}
-
-Rules:
-- Ignore any diagram-like snippets unless intent is 'diagram'.
-- Do not repeat earlier turns verbatim.
-- Write in the user's language for all sections except the follow-ups, which stay in English.
-
-=== SOURCE BEGIN ===
+SOURCE:
 {synthesis_source}
-=== SOURCE END ===
 """
-    _push_turn(state, role="system", name="unifier_system", content=prompt)
     resp = llm.invoke(prompt)
     final_text = getattr(resp, "content", str(resp))
-    final_text = _strip_markdown_and_diagrams(final_text) if intent != "diagram" else final_text
+    final_text = _strip_all_markdown(final_text)
+
+    # chips para el front a partir de "Next:"
+    secs = _split_sections(final_text)
+    chips = []
+    if secs.get("Next"):
+        for ln in secs["Next"].splitlines():
+            ln = ln.strip(" -•\t")
+            if ln: chips.append(ln)
+    state["suggestions"] = chips[:6] if chips else state.get("suggestions", [])
+
+    # Traza para el modal
+    _push_turn(state, role="system", name="unifier_system", content=prompt)
     _push_turn(state, role="assistant", name="unifier", content=final_text)
 
-    # extrae follow-ups (si vienen formateados) para el front; si no, usa seed
-    suggs = []
-    for m in re.findall(r"Suggested follow-ups.*?:\s*(?:- .+?)(?:\n\n|\Z)", final_text, re.I | re.S):
-        suggs += [s.strip("- ").strip() for s in m.splitlines() if s.strip().startswith("- ")]
-    if not suggs:
-        suggs = seed
-
-    return {**state, "endMessage": final_text, "suggestions": suggs}
+    return {**state, "endMessage": final_text}
 
 # --- Classifier ---
 
