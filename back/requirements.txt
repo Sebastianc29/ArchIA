@@ -16,3 +16,4 @@ python-multipart
 unstructured
 chromadb
 langgraph-checkpoint-postgres
+httpx

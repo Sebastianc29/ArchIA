@@ -23,6 +23,10 @@ from vertexai.preview.generative_models import Image
 from src.rag_agent import get_retriever
 from src.quoting import pack_quotes, render_quotes_md
 
+# Kroki
+from src.diagram_agent import diagram_node
+
+
 # ========== Setup
 
 load_dotenv(dotenv_path=find_dotenv('.env.development'))
@@ -55,6 +59,9 @@ class GraphState(TypedDict):
 
     endMessage: str
     mermaidCode: str
+
+    hasVisitedDiagram: bool  # Kroki
+    diagram: dict            # output del nodo diagram_agent
 
     # buffers / RAG / memoria liviana
     turn_messages: list
@@ -339,9 +346,10 @@ def analyze_tool(image_path: str, image_path2: str) -> str:
         image2
     ])
     return response
+
 # ========== Router
 
-def router(state: GraphState) -> Literal["investigator", "creator", "evaluator", "asr", "unifier"]:
+def router(state: GraphState) -> Literal["investigator", "creator", "evaluator", "diagram_agent", "asr", "unifier"]:
     if state["nextNode"] == "unifier":
         return "unifier"
     elif state["nextNode"] == "asr" and not state.get("hasVisitedASR", False):
@@ -350,67 +358,62 @@ def router(state: GraphState) -> Literal["investigator", "creator", "evaluator",
         return "investigator"
     elif state["nextNode"] == "creator" and not state["hasVisitedCreator"]:
         return "creator"
+    elif state["nextNode"] == "diagram_agent" and not state.get("hasVisitedDiagram", False):
+        return "diagram_agent"
     elif state["nextNode"] == "evaluator" and not state["hasVisitedEvaluator"]:
         return "evaluator"
     else:
         return "unifier"
 
+
 # ========== Nodos
 
 def supervisor_node(state: GraphState):
     uq = (state.get("userQuestion") or "")
-    # idioma preferido
+
+    # si ya hay un SVG listo en este turno, vamos directo al unifier
+    d = state.get("diagram") or {}
+    if d.get("ok") and d.get("svg_b64"):
+        return {**state, "nextNode": "unifier", "intent": "diagram"}
+
+    # idioma
     lang = detect_lang(uq)
     state_lang = "es" if lang == "es" else "en"
 
-    # follow-ups explícitos (no creamos un nodo aparte para evitar errores)
     fu_intent = classify_followup(uq)
 
-    # Detecciones duras
-    asr_terms = ["asr", "quality attribute scenario", "qas"]
-    wants_asr = any(t in uq.lower() for t in asr_terms) or ("asr example" in uq.lower())
-    diagram_terms = ["diagram", "mermaid", "draw", "component diagram", "architecture diagram"]
-    wants_diagram = any(t in uq.lower() for t in diagram_terms) or bool(state.get("imagePath1") or state.get("imagePath2"))
+    # keywords para diagramas (ES/EN)
+    diagram_terms = [
+        "diagrama", "diagrama de componentes", "diagrama de arquitectura",
+        "diagram", "component diagram", "architecture diagram",
+        "mermaid", "plantuml", "c4", "bpmn", "uml"
+    ]
+    wants_diagram = any(t in uq.lower() for t in diagram_terms)
 
-    # Baseline por LLM
+    # baseline LLM (no incluye diagram_agent en el schema, está ok)
     message = [{"role": "system", "content": makeSupervisorPrompt(state)}]
     response = llm.with_structured_output(supervisorSchema).invoke(message)
     next_node = response["nextNode"]
     local_q = response["localQuestion"]
 
-    # Reglas prioritarias
     intent_val = state.get("intent", "general")
-    if wants_asr:
-        next_node = "asr"
-        intent_val = "asr"
-        local_q = f"Create a concrete QAS (ASR) for: {state['userQuestion']}"
-    elif fu_intent == "make_asr":
-        next_node = "asr"
-        intent_val = "asr"
-        local_q = f"Create a concrete QAS (ASR) for: {state['userQuestion']}"
+    if any(x in uq.lower() for x in ["asr", "quality attribute scenario", "qas"]) or fu_intent == "make_asr":
+        next_node = "asr"; intent_val = "asr"; local_q = f"Create a concrete QAS (ASR) for: {state['userQuestion']}"
     elif wants_diagram or fu_intent in ("component_view","deployment_view","functional_view"):
-        next_node = "creator"
-        intent_val = "diagram"
-        local_q = uq
+        next_node = "diagram_agent"; intent_val = "diagram"; local_q = uq
     elif fu_intent in ("explain_tactics","compare","checklist"):
-        next_node = "investigator"
-        intent_val = "architecture"
+        next_node = "investigator"; intent_val = "architecture"
 
-    # Evitar ir a unifier sin nada
+    # evita unifier si no se visitó nada este turno
     if next_node == "unifier" and not (
-        state["hasVisitedInvestigator"] or state["hasVisitedCreator"] or
-        state["hasVisitedEvaluator"] or state.get("hasVisitedASR", False)
+        state.get("hasVisitedInvestigator") or state.get("hasVisitedCreator") or
+        state.get("hasVisitedEvaluator") or state.get("hasVisitedASR") or
+        state.get("hasVisitedDiagram")
     ):
-        next_node = "investigator"
-        intent_val = "architecture"
+        next_node = "investigator"; intent_val = "architecture"
 
-    return {
-        **state,
-        "localQuestion": local_q,
-        "nextNode": next_node,
-        "intent": intent_val,
-        "language": state_lang,
-    }
+    return {**state, "localQuestion": local_q, "nextNode": next_node, "intent": intent_val, "language": state_lang}
+
 
 # --- ASR node ---
 
@@ -623,11 +626,9 @@ def _last_ai_by(state, name: str) -> str:
     return ""
 
 def _strip_all_markdown(text: str) -> str:
-    # sin fences / markdown / mermaid
     text = re.sub(r"```.*?```", "", text, flags=re.S)
     text = re.sub(r"^\s*#.*$", "", text, flags=re.M)
     text = text.replace("**", "")
-    # quita líneas típicas de mermaid
     out = []
     for ln in text.splitlines():
         if re.search(r"^\s*(graph\s+(LR|TB)|flowchart|sequenceDiagram|classDiagram)\b", ln, re.I):
@@ -638,7 +639,6 @@ def _strip_all_markdown(text: str) -> str:
     return "\n".join(out).strip()
 
 def _extract_rag_sources_from(text: str) -> str:
-    """Lee el bloque 'SOURCES:' de la salida del researcher (local_RAG)."""
     m = re.search(r"SOURCES:\s*(.+)$", text, flags=re.S | re.I)
     if not m:
         return ""
@@ -648,11 +648,9 @@ def _extract_rag_sources_from(text: str) -> str:
         ln = ln.strip(" -\t")
         if ln:
             lines.append(ln)
-    # limita un poco
     return "\n".join(lines[:8])
 
 def _split_sections(text: str) -> dict:
-    """Divide por encabezados 'Answer:', 'References:', 'Next:' para extraer chips."""
     sections = {"Answer": "", "References": "", "Next": ""}
     current = None
     for ln in text.splitlines():
@@ -672,7 +670,29 @@ def unifier_node(state: GraphState) -> GraphState:
     lang = state.get("language", "es")
     intent = state.get("intent", "general")
 
-    # 1) Caso especial: ASR -> entrega tal cual (ya te funcionaba bien)
+    # 🖼️ Mostrar el diagrama si existe
+    d = state.get("diagram") or {}
+    if d.get("ok") and d.get("svg_b64"):
+        data_url = f'data:image/svg+xml;base64,{d["svg_b64"]}'
+        head = "Aquí tienes el diagrama solicitado:" if lang=="es" else "Here is your requested diagram:"
+        tips = [
+            "¿Quieres el mismo diagrama en PNG?" if lang=="es" else "Do you want this diagram as PNG?",
+            "¿Genero también una vista de despliegue?" if lang=="es" else "Generate a Deployment view too?",
+            "¿Deseas ver/editar el código fuente?" if lang=="es" else "Want to see/edit the diagram source?"
+            ]
+        end_text = f"""{head}
+        ![diagram]({data_url})
+        
+        Next:
+        - """ + "\n- ".join(tips)
+        state["suggestions"] = tips
+        return {**state, "endMessage": end_text, "intent": "diagram"}
+
+
+    # --- (resto de tu unifier tal cual) ---
+
+
+    # 1) Caso especial: ASR
     if intent == "asr":
         last_asr = ""
         for m in reversed(state.get("messages", [])):
@@ -690,11 +710,10 @@ def unifier_node(state: GraphState) -> GraphState:
         state["turn_messages"] = state.get("turn_messages", []) + [
             {"role": "assistant", "name": "unifier", "content": end_text}
         ]
-        # chips
         state["suggestions"] = followups
         return {**state, "endMessage": end_text}
 
-    # 2) Caso especial: saludo / smalltalk -> respuesta corta, sin plantilla
+    # 2) Caso especial: saludo / smalltalk
     if intent in ("greeting", "smalltalk"):
         hello = "¡Hola! ¿Sobre qué tema de arquitectura quieres profundizar?" if lang=="es" \
                 else "Hi! What software-architecture topic would you like to explore?"
@@ -708,8 +727,7 @@ def unifier_node(state: GraphState) -> GraphState:
         state["suggestions"] = nexts
         return {**state, "endMessage": end_text}
 
-    # 3) Modo compacto por defecto (respuesta + referencias + siguientes pasos)
-    #    Prepara SOURCE y posibles referencias del RAG
+    # 3) Compacto por defecto (respuesta + referencias + siguientes pasos)
     researcher_txt = _last_ai_by(state, "researcher")
     evaluator_txt  = _last_ai_by(state, "evaluator")
     creator_txt    = _last_ai_by(state, "creator")
@@ -755,7 +773,6 @@ SOURCE:
     final_text = getattr(resp, "content", str(resp))
     final_text = _strip_all_markdown(final_text)
 
-    # chips para el front a partir de "Next:"
     secs = _split_sections(final_text)
     chips = []
     if secs.get("Next"):
@@ -764,7 +781,6 @@ SOURCE:
             if ln: chips.append(ln)
     state["suggestions"] = chips[:6] if chips else state.get("suggestions", [])
 
-    # Traza para el modal
     _push_turn(state, role="system", name="unifier_system", content=prompt)
     _push_turn(state, role="assistant", name="unifier", content=final_text)
 
@@ -778,7 +794,7 @@ class ClassifyOut(TypedDict):
     use_rag: bool
 
 def classifier_node(state: GraphState) -> GraphState:
-    msg = state.get("userQuestion", "")
+    msg = state.get("userQuestion", "") or ""
     prompt = f"""
 Classify the user's last message. Return JSON with:
 - language: "en" or "es"
@@ -791,10 +807,13 @@ User message:
 """
     out = llm.with_structured_output(ClassifyOut).invoke(prompt)
 
-    low = (msg or "").lower()
+    low = msg.lower()
     intent = out["intent"]
-    if ("diagram" in low or "mermaid" in low) and intent != "asr":
-        intent = "diagram"
+
+    # ← clave: disparar 'diagram' ante “diagrama/diagram/mermaid/uml…”
+    if any(k in low for k in ["diagrama", "diagram", "mermaid", "plantuml", "c4", "bpmn", "uml"]):
+        if intent != "asr":
+            intent = "diagram"
 
     return {
         **state,
@@ -803,21 +822,41 @@ User message:
         "force_rag": bool(out["use_rag"]),
     }
 
+
+def boot_node(state: GraphState) -> GraphState:
+    """Resetea banderas y buffers al inicio de cada turno."""
+    return {
+        **state,
+        "hasVisitedInvestigator": False,
+        "hasVisitedCreator": False,
+        "hasVisitedEvaluator": False,
+        "hasVisitedASR": False,
+        "hasVisitedDiagram": False,
+        "mermaidCode": "",
+        "diagram": {},
+        "endMessage": "",
+    }
+
+
 # ========== Wiring
 
 builder.add_node("classifier", classifier_node)
 builder.add_node("supervisor", supervisor_node)
 builder.add_node("investigator", researcher_node)
 builder.add_node("creator", creator_node)
+builder.add_node("diagram_agent", diagram_node)  # Kroki
 builder.add_node("evaluator", evaluator_node)
 builder.add_node("unifier", unifier_node)
 builder.add_node("asr", asr_node)
 
-builder.add_edge(START, "classifier")
+builder.add_node("boot", boot_node)
+builder.add_edge(START, "boot")
+builder.add_edge("boot", "classifier")
 builder.add_edge("classifier", "supervisor")
 builder.add_conditional_edges("supervisor", router)
 builder.add_edge("investigator", "supervisor")
 builder.add_edge("creator", "supervisor")
+builder.add_edge("diagram_agent", "supervisor")  # Kroki
 builder.add_edge("evaluator", "supervisor")
 builder.add_edge("asr", "supervisor")
 builder.add_edge("unifier", END)

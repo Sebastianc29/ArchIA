@@ -1,4 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import MermaidChart from "./MermaidChart";
 import {
   Box, Paper, List, ListItem, TextField, Button, Typography, Dialog,
@@ -88,6 +90,27 @@ const extractRagSources = (internal = []) => {
   }
   return out;
 };
+
+/* ======================= Assistant bubble (Markdown sin HTML crudo) ======================= */
+function AssistantMessage({ text, pending }) {
+  if (pending) {
+    return (
+      <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
+        <CircularProgress size={16} />
+        <Typography variant="caption" sx={{ color: "##CFD8DC" }}>
+          generating response…
+        </Typography>
+      </Box>
+    );
+  }
+  return (
+    <Box className="assistant-message prose prose-invert max-w-none" sx={{ color: "white" }}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+        {text || ""}
+      </ReactMarkdown>
+    </Box>
+  );
+}
 
 /* ======================= Chat ======================= */
 export default function Chat() {
@@ -208,7 +231,8 @@ export default function Chat() {
               mermaidCode: data?.mermaidCode || "",
               session_id: data?.session_id || sessionId,
               message_id: data?.message_id,
-              suggestions: Array.isArray(data?.suggestions) && data.suggestions.length > 0
+              diagram: data?.diagram || null,
+              suggestions: Array.isArray(data?.suggestions) && data?.suggestions.length > 0
                 ? data.suggestions
                 : parseNextFromText(textOut) // fallback si no vino el array
             }
@@ -343,6 +367,21 @@ export default function Chat() {
         <List sx={{ px: 2, py: 1 }}>
           {messages.map((msg) => {
             const isUser = msg.sender === "usuario";
+
+            // 1) Construye un data URL desde diagram.svg_b64 o desde el HTML del texto
+            const diagramDataUrl = !isUser
+              ? (
+                  (msg?.diagram?.ok && msg?.diagram?.svg_b64)
+                    ? `data:image/svg+xml;base64,${msg.diagram.svg_b64}`
+                    : ((msg.text || "").match(/data:image\/svg\+xml;base64,[A-Za-z0-9+/=]+/)?.[0] || null)
+                )
+              : null;
+
+            // 2) Evita que ReactMarkdown intente renderizar <img> rotos
+            const cleanedAssistantText = !isUser
+              ? (msg.text || "").replace(/<img[^>]*>/gi, "")
+              : (msg.text || "");
+
             const roles = !isUser ? summarizeRoles(msg.internal_messages) : [];
             const ragSources = !isUser ? extractRagSources(msg.internal_messages) : [];
             const ratedKey = `${msg.session_id}-${msg.message_id}`;
@@ -382,9 +421,30 @@ export default function Chat() {
                     )}
                   </Box>
 
-                  <Typography variant="body1" sx={{ color: "white", whiteSpace: "pre-wrap", opacity: msg.pending ? 0.75 : 1 }}>
-                    {msg.pending ? " " : (msg.text || "")}
-                  </Typography>
+                  {isUser ? (
+                    <Typography variant="body1" sx={{ color: "white", whiteSpace: "pre-wrap", opacity: msg.pending ? 0.75 : 1 }}>
+                      {msg.pending ? " " : (msg.text || "")}
+                    </Typography>
+                  ) : (
+                    <AssistantMessage text={cleanedAssistantText} pending={msg.pending} />
+                  )}
+
+                  {/* Render del diagrama SVG si existe */}
+                  {!isUser && diagramDataUrl && (
+                    <Box sx={{ mt: 1.5 }}>
+                      <img
+                        src={diagramDataUrl}
+                        alt="diagram"
+                        style={{
+                          maxWidth: "100%",
+                          height: "auto",
+                          border: "1px solid rgba(255,255,255,0.12)",
+                          borderRadius: 8,
+                          background: "#fff"
+                        }}
+                      />
+                    </Box>
+                  )}
 
                   {msg.pending && (
                     <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
@@ -559,7 +619,8 @@ export default function Chat() {
           </List>
         </DialogContent>
       </Dialog>
-            <Box
+
+      <Box
         component="footer"
         sx={{
           px: 2,
@@ -575,7 +636,6 @@ export default function Chat() {
       >
         {DISCLAIMER}
       </Box>
-
     </Box>
   );
 }
