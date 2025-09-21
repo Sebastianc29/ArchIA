@@ -1,85 +1,155 @@
 # back/build_vectorstore.py
 from __future__ import annotations
-import os, shutil
+
+import os
 from pathlib import Path
-import argparse
-from dotenv import load_dotenv, find_dotenv
-
-load_dotenv(find_dotenv(".env.development"), override=False)
-load_dotenv(find_dotenv(".env"), override=False)
-
-try:
-    from langchain_chroma import Chroma
-except Exception:
-    from langchain_community.vectorstores import Chroma
+from typing import Dict, List, Tuple
 
 from langchain_openai import OpenAIEmbeddings
-from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader, TextLoader
+try:
+    from langchain_chroma import Chroma
+except Exception:  # pragma: no cover
+    from langchain_community.vectorstores import Chroma
+
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-BASE_DIR = Path(__file__).resolve().parent          # .../back
-DEFAULT_CHROMA_DIR = str((BASE_DIR / "chroma_db").resolve())
+# ================== Paths / Config ==================
+
+BASE_DIR = Path(__file__).resolve().parent
 DOCS_DIR = BASE_DIR / "docs"
+PERSIST_DIR = Path(os.environ.get("CHROMA_DIR", str(BASE_DIR / "chroma_db")))
 
-def build_vectorstore(persist_directory: str, force_rebuild: bool=False):
-    if force_rebuild and os.path.isdir(persist_directory):
-        print(f"[build] Borrando BD previa: {persist_directory}")
-        shutil.rmtree(persist_directory, ignore_errors=True)
-    os.makedirs(persist_directory, exist_ok=True)
+DOCS_DIR.mkdir(parents=True, exist_ok=True)
+PERSIST_DIR.mkdir(parents=True, exist_ok=True)
 
-    print(f"[build] docs_dir          = {DOCS_DIR}")
-    print(f"[build] persist_directory = {persist_directory}")
+COLLECTION_NAME = "arquia"
+EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
 
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+# Libros permitidos (título lógico -> patrones para encontrar el PDF)
+ALLOWED_BOOKS: Dict[str, List[str]] = {
+    "Software Architecture in Practice (3e)": [
+        "Software Architecture in practice.pdf",
+        "Software_Architecture_in_Practice",
+        "Architecture in Practice",
+    ],
+    "Evaluating Software Architectures": [
+        "Software architectures evaluation.pdf",
+        "Evaluating Software Architectures",
+        "Architecture Evaluation",
+    ],
+}
 
-    pdf_loader = DirectoryLoader(str(DOCS_DIR), glob="**/*.pdf", loader_cls=PyPDFLoader)
-    txt_loader = DirectoryLoader(str(DOCS_DIR), glob="**/*.txt",
-                                 loader_cls=TextLoader,
-                                 loader_kwargs={"encoding": "utf-8", "errors": "ignore"})
 
-    raw_docs = []
-    for loader in (pdf_loader, txt_loader):
-        try:
-            loaded = loader.load()
-            raw_docs += loaded
-            print(f"[build] Cargados {len(loaded):4d} docs de {loader.__class__.__name__}")
-        except Exception as e:
-            print(f"[WARN] loader error ({loader.__class__.__name__}): {e}")
+def _match_pdf(files: List[Path], patterns: List[str]) -> Path | None:
+    """
+    Busca el primer archivo cuyo nombre contenga alguno de los patrones (case-insensitive).
+    """
+    low_patterns = [p.lower() for p in patterns]
+    for f in files:
+        fname = f.name.lower()
+        if any(p in fname for p in low_patterns):
+            return f
+    return None
 
-    for d in raw_docs:
-        src = d.metadata.get("source") or d.metadata.get("file_path") or ""
-        d.metadata["source"] = os.path.basename(src)
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=200)
-    chunks = splitter.split_documents(raw_docs)
-    print(f"[build] Total chunks: {len(chunks)}")
+def _load_docs() -> List:
+    """
+    Carga en memoria las páginas de los PDFs permitidos, con metadatos uniformes.
+    """
+    all_pdfs = sorted(list(DOCS_DIR.glob("*.pdf")))
+    if not all_pdfs:
+        print(f"[build] No se encontraron PDFs en {DOCS_DIR}.")
+        return []
 
-    vectordb = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        collection_name="arquia",
-        persist_directory=persist_directory,
+    docs = []
+    for source_title, patterns in ALLOWED_BOOKS.items():
+        fpath = _match_pdf(all_pdfs, patterns)
+        if not fpath:
+            print(f"[build] (Aviso) No se encontró PDF para: {source_title}. "
+                  f"Coloca un archivo que contenga uno de: {patterns}")
+            continue
+
+        print(f"[build] Cargando: {source_title}  <-- {fpath.name}")
+        loader = PyPDFLoader(str(fpath))
+        pages = loader.load()
+        # normaliza metadatos
+        for d in pages:
+            md = d.metadata or {}
+            d.metadata = {
+                "title": Path(md.get("source") or fpath).name,   # nombre del archivo
+                "source_title": source_title,                    # título lógico del libro (para filtrar)
+                "source_path": str(fpath),                       # ruta absoluta
+                "page": md.get("page", md.get("page_number")),   # número de página (int)
+                "page_label": md.get("page_label"),              # etiqueta (si existe)
+            }
+        docs.extend(pages)
+
+    return docs
+
+
+def _split_docs(docs: List):
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1200,
+        chunk_overlap=200,
+        add_start_index=True,
+        separators=["\n\n", "\n", ". ", " ", ""],
     )
-    # desde Chroma 0.4.x persiste automático
-    print("[build] ¡Vector store construido y persistido!")
+    return splitter.split_documents(docs)
 
-    # Resumen
-    vs = Chroma(collection_name="arquia", embedding_function=embeddings,
-                persist_directory=persist_directory)
-    metas = (vs._collection.get(include=['metadatas']).get('metadatas')) or []
-    print(f"[build] Resumen -> chunks en BD: {len(metas)}")
-    print("[build] Fuentes (primeras 20):",
-          *sorted({(m or {}).get("source","unknown") for m in metas if m})[:20],
-          sep="\n   - ")
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--rebuild", action="store_true", help="Borra y reconstruye")
-    args = parser.parse_args()
+    print("[build] docs_dir          =", DOCS_DIR)
+    print("[build] persist_directory =", PERSIST_DIR)
 
-    persist_directory = os.environ.get("CHROMA_DIR", DEFAULT_CHROMA_DIR)
-    build_vectorstore(persist_directory=persist_directory, force_rebuild=args.rebuild)
-    print(f"[build] Listo. BD en: {persist_directory}")
+    docs = _load_docs()
+    if not docs:
+        print("[build] No hay documentos válidos. Copia los PDFs a /back/docs y reintenta.")
+        raise SystemExit(1)
+
+    chunks = _split_docs(docs)
+    print(f"[build] Total chunks: {len(chunks)}")
+
+    # Embeddings y vectorstore
+    emb = OpenAIEmbeddings(model=EMBED_MODEL)
+    vectordb = Chroma.from_documents(
+        documents=chunks,
+        embedding=emb,
+        persist_directory=str(PERSIST_DIR),
+        collection_name=COLLECTION_NAME,
+    )
+    vectordb = Chroma.from_documents(
+    documents=chunks,
+    embedding=emb,
+    persist_directory=str(PERSIST_DIR),
+    collection_name=COLLECTION_NAME,
+)
+
+# Persistencia:
+# - langchain-chroma: ya quedó persistido automáticamente
+# - langchain_community: requiere .persist()
+    if hasattr(vectordb, "persist"):
+        try:
+            vectordb.persist()
+        except Exception:
+            pass
+
+    print("[build] ¡Vector store construido y persistido!")
+
+    # Resumen (fuentes únicas)
+    titles = []
+    seen = set()
+    for d in chunks[:1000]:  # muestrario
+        t = (d.metadata or {}).get("title")
+        if t and t not in seen:
+            seen.add(t)
+            titles.append(t)
+    print("[build] Fuentes (muestra):")
+    for t in titles[:10]:
+        print("   -", t)
+
+    print(f"[build] Listo. BD en: {PERSIST_DIR}")
+
 
 if __name__ == "__main__":
     main()

@@ -446,13 +446,6 @@ export default function Chat() {
                     </Box>
                   )}
 
-                  {msg.pending && (
-                    <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
-                      <CircularProgress size={16} />
-                      <Typography variant="caption" sx={{ color: "##CFD8DC" }}>generating response…</Typography>
-                    </Box>
-                  )}
-
                   {msg.mermaidCode && (
                     <Box sx={{ mt: 2 }}>
                       <MermaidChart chart={msg.mermaidCode} />
