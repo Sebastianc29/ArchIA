@@ -1,14 +1,18 @@
 from typing import Optional
 from pathlib import Path
-import os, re, sqlite3
+import os, re, sqlite3, base64
 
 from fastapi import UploadFile, File, Form, HTTPException, Request, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
+from .routers.diagram import router as diagram_router
+
+from langchain_core.messages import HumanMessage
 from src.graph import graph
 from src.rag_agent import create_or_load_vectorstore
 from src.memory import init as memory_init, get as memory_get, set_kv as memory_set
+from src.clients.kroki_client import render_kroki_sync  # <- para el fallback
 
 memory_init()
 
@@ -31,7 +35,7 @@ async def lifespan(app: FastAPI):
     yield
     print("[shutdown] Cerrando app...")
 
-# Una sola instancia de FastAPI (evita duplicados)
+# Una sola instancia de FastAPI
 app = FastAPI(title="ArquIA API", lifespan=lifespan)
 
 # ===================== Paths ==========================
@@ -94,7 +98,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Helpers
+app.include_router(diagram_router)
+
+# ===================== Helpers de tema ===================
 def _normalize_topic(xx: str) -> str:
     x = (xx or "").lower()
     if "latenc" in x or "latencia" in x: return "latency"
@@ -111,6 +117,107 @@ def _needs_topic_hint(q: str) -> bool:
     mentions_tactics = bool(re.search(r"\btactic|\btáctic|\btactica|\btáctica", low))
     has_topic = bool(_extract_topic_from_text(low))
     return mentions_tactics and not has_topic
+
+# ===================== ASR helpers =======================
+ASR_HEAD_RE = re.compile(
+    r"\b(ASR|Architecture[-\s]?Significant[-\s]?Requirement|Requisit[oa]\s+Significativ[oa]\s+de\s+Arquitectura)\b[:：]?",
+    re.I,
+)
+
+def _looks_like_make_asr(msg: str) -> bool:
+    if not msg: return False
+    low = msg.lower()
+    return bool(re.search(r"\b(create|make|draft|write|generate|produce|compose)\b.*\b(asr)\b", low)) \
+        or bool(re.search(r"\b(crea|haz|redacta|genera|produce)\b.*\b(asr)\b", low))
+
+def _extract_asr_from_message(msg: str) -> str:
+    if not msg: return ""
+    m = re.search(r"(?:review|evaluate|revisar|evalua\w*)\s+(?:this|este|esta)?\s*asr\s*[:：]\s*(.+)$", msg, re.I | re.S)
+    if m: return m.group(1).strip()
+    m = re.search(r"(?:review|evaluate|revisar|evalua\w*)\s+(?:this|este|esta)?\s*asr[\s,)\-:]*\s*(.+)$", msg, re.I | re.S)
+    if m: return m.group(1).strip()
+    m = re.search(r"\basr\s*[:：]\s*(.+)$", msg, re.I | re.S)
+    if m: return m.group(1).strip()
+    m = re.search(r"(?:review|evaluate|revisar|evalua\w*)\s+(?:this|este|esta)?\s*asr\s*\((.+)\)", msg, re.I | re.S)
+    if m: return m.group(1).strip()
+    return ""
+
+def _extract_asr_from_result_text(text: str) -> str:
+    if not text: return ""
+    m = re.search(r"```asr\s*([\s\S]*?)```", text, re.I)
+    if m: return m.group(1).strip()
+    if re.search(r"\b(Summary|Context|Design\s+tactics|Trade[-\s]?offs|Acceptance\s+criteria|Validation\s+plan)\b", text, re.I):
+        return text.strip()
+    m = ASR_HEAD_RE.search(text)
+    if m:
+        start = m.start()
+        asr = text[start:]
+        asr = re.split(r"\n\s*#{1,6}\s|\n\s*(?:Rationale|Razonamiento|Conclusiones)\s*[:：]", asr, maxsplit=1)[0]
+        return asr.strip()
+    m = re.search(r"(?:^|\n)\s*[-*]\s*ASR\s*[:：]\s*(.+)", text, re.I)
+    if m: return m.group(1).strip()
+    return ""
+
+def _wants_diagram_of_that_asr(msg: str) -> bool:
+    if not msg: return False
+    low = msg.lower()
+    wants_diagram = any(k in low for k in ["diagram", "diagrama"])
+    mentions_component = any(k in low for k in ["component diagram", "diagram component", "componentes", "de componentes"])
+    mentions_that_asr = any(k in low for k in ["that asr", "ese asr", "esa asr", "dicho asr", "ese requisito"])
+    return (wants_diagram and mentions_that_asr) or (mentions_component and mentions_that_asr)
+
+# ====== Fallback builder (solo cuando lo piden o falta) ======
+def _build_component_puml_from_text(text: str, title_hint: str = "") -> str:
+    t = (text or "").lower()
+    def has(*kw): return any(k in t for k in kw)
+
+    nodes = ['actor User as USER', 'component "Backend FastAPI" as API']
+    edges = ['USER --> API : HTTP(S) request']
+
+    if has("front", "react", "vite", "ui", "web"):
+        nodes.append('component "Frontend (React/Vite)" as FE')
+        edges += ['USER --> FE : Browser', 'FE --> API : REST/JSON']
+
+    if has("gateway", "nginx", "ingress", "api gateway"):
+        nodes.append('component "API Gateway" as GATE')
+        edges += ['FE --> GATE', 'GATE --> API']
+
+    if has("auth", "oauth", "jwt", "keycloak"):
+        nodes.append('component "Auth Service" as AUTH')
+        edges.append('API --> AUTH : validate token')
+
+    if has("db", "database", "postgres", "mysql", "mongodb"):
+        nodes.append('database "DB" as DB')
+        edges.append('API --> DB : SQL/NoSQL')
+
+    if has("cache", "redis"):
+        nodes.append('component "Cache (Redis)" as CACHE')
+        edges.append('API --> CACHE')
+
+    if has("queue", "broker", "kafka", "rabbit"):
+        nodes.append('component "Message Broker" as MQ')
+        edges.append('API --> MQ : events')
+
+    if has("rag", "vector", "embedding", "chroma", "pdf"):
+        nodes.append('component "Vector Store (Chroma)" as VS')
+        nodes.append('component "Docs Storage (PDFs)" as DOCS')
+        edges += ['API --> VS : search', 'API --> DOCS : load']
+
+    if has("llm", "openai", "azure openai", "model"):
+        nodes.append('component "LLM Provider" as LLM')
+        edges.append('API --> LLM : inference')
+
+    if has("kroki", "plantuml", "c4"):
+        nodes.append('component "Kroki" as KROKI')
+        edges.append('API --> KROKI : render diagram')
+
+    if len(nodes) <= 2:
+        nodes += ['database "DB" as DB', 'component "Kroki" as KROKI']
+        edges += ['API --> DB', 'API --> KROKI']
+
+    body = "\n".join(nodes + [""] + edges)
+    title = (title_hint or "Component Diagram").strip()[:60]
+    return "@startuml\n!pragma teoz true\n" + f"title {title}\n\n{body}\n@enduml\n"
 
 # ===================== Health ===========================
 @app.get("/")
@@ -141,6 +248,9 @@ async def message(
     # ID incremental para feedback por mensaje
     message_id = get_next_message_id(session_id)
 
+    # Hilo único por turno (si quieres memoria full por sesión, usa thread_id = session_id)
+    thread_id = f"{session_id}:{message_id}"
+
     # --- Manejo de imágenes (opcionales) ---
     image_path1 = ""
     if image1 and image1.filename:
@@ -156,42 +266,31 @@ async def message(
             f.write(await image2.read())
         image_path2 = str(dest2)
 
-    # --- Mensajes base para el grafo ---
-    messageList = [{"role": "user", "content": message}]
+    # --- Turno actual como HumanMessage(s) ---
+    turn_messages = [HumanMessage(content=message)]
     if image_path1:
-        messageList.append({"role": "user", "content": "this is the image path: " + image_path1})
+        turn_messages.append(HumanMessage(content=f"[image_path_1] {image_path1}"))
     if image_path2:
-        messageList.append({"role": "user", "content": "this is the second image path: " + image_path2})
+        turn_messages.append(HumanMessage(content=f"[image_path_2] {image_path2}"))
 
-    # --- Memoria previa para continuidad de conversación ---
+    # --- Memoria previa ---
     last_topic = memory_get(user_id, "topic", "")
+    asr_prev   = memory_get(user_id, "current_asr", "")
     asr_notes  = memory_get(user_id, "asr_notes", "")
     memory_text = f"Tema previo: {last_topic}. ASR previas: {asr_notes}".strip() or "N/A"
 
-    # --- Config del hilo LangGraph ---
-    config = {"configurable": {"thread_id": str(session_id)}}
+    # --- ASR pegado por el usuario (si lo hay) ---
+    asr_in_msg = _extract_asr_from_message(message)
+    if asr_in_msg:
+        memory_set(user_id, "current_asr", asr_in_msg)
+    made_asr = _looks_like_make_asr(message)
+
+    # --- Config del grafo ---
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 50}
     user_lang = detect_lang(message)
 
-    # --- Heurísticas locales para topic_hint y force_rag ---
-    def _normalize_topic(xx: str) -> str:
-        x = (xx or "").lower()
-        if "latenc" in x or "latencia" in x: return "latency"
-        if "scalab" in x or "escalabilidad" in x: return "scalability"
-        if "availab" in x or "disponibilidad" in x: return "availability"
-        if "perform" in x or "rendim" in x: return "performance"
-        return ""
-
-    def _extract_topic_from_text(q: str) -> str:
-        return _normalize_topic(q)
-
-    def _needs_topic_hint(q: str) -> bool:
-        low = (q or "").lower()
-        mentions_tactics = bool(re.search(r"\btactic|\btáctic|\btactica|\btáctica", low))
-        has_topic = bool(_extract_topic_from_text(low))
-        return mentions_tactics and not has_topic
-
+    # --- Heurísticas locales ---
     topic_hint = _extract_topic_from_text(message) or _extract_topic_from_text(last_topic)
-
     msg_low = message.lower()
     force_rag = (
         _needs_topic_hint(message) or
@@ -201,20 +300,24 @@ async def message(
         ))
     )
 
-    # --- Limpia estado residual del hilo (por si quedó algo del turno anterior) ---
+    # --- Limpieza parcial del estado (sin borrar historial) ---
     try:
-        state = graph.get_state(config)
-        if state:
-            graph.update_state(config, {"endMessage": "", "mermaidCode": ""})
+        graph.update_state(config, {"values": {
+            "endMessage": "",
+            "mermaidCode": "",
+            "diagram": None,
+            "hasVisitedDiagram": False,
+            "turn_messages": [],
+            "current_asr": memory_get(user_id, "current_asr", ""),
+        }})
     except Exception:
-        # no es crítico si falla
-        pass
+        pass  # no crítico
 
     # --- Invocación del grafo ---
     try:
         result = graph.invoke(
             {
-                "messages": messageList,
+                "messages": turn_messages,
                 "userQuestion": message,
                 "localQuestion": "",
                 "hasVisitedInvestigator": False,
@@ -233,20 +336,20 @@ async def message(
                 "language": user_lang,
                 "intent": "general",
                 "force_rag": force_rag,
-                "topic_hint": topic_hint,  # si tu GraphState no lo tiene, puedes quitar esta línea
+                "topic_hint": topic_hint,
+                "current_asr": memory_get(user_id, "current_asr", ""),
             },
             config,
         )
     except Exception as e:
-        # Imprime traza completa en consola para depurar rápidamente
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Graph error: {e}")
 
-    # --- Feedback inicial para este mensaje ---
+    # --- Feedback inicial ---
     upsert_feedback(session_id=session_id, message_id=message_id, up=0, down=0)
 
-    # --- Actualiza memoria simple por palabras clave ---
+    # --- Actualiza memoria simple ---
     low = message.lower()
     if "latencia" in low:
         memory_set(user_id, "topic", "latencia")
@@ -255,13 +358,67 @@ async def message(
     if "asr" in low:
         memory_set(user_id, "asr_notes", message)
 
-    # --- Payload del turno actual (lo que consume el front) ---
+    # --- Captura ASR desde la respuesta del grafo (si redactó uno) ---
+    end_msg = result.get("endMessage", "") or ""
+    asr_from_result = _extract_asr_from_result_text(end_msg)
+    if asr_from_result:
+        memory_set(user_id, "current_asr", asr_from_result)
+    elif made_asr and len(end_msg) > 80:
+        memory_set(user_id, "current_asr", end_msg.strip())
+
+    # ===================== DIAGRAMA =====================
+    # Usa el diagrama que venga del agente. SOLO usa fallback si:
+    #   (1) el usuario pidió “diagram ... of that ASR”, o
+    #   (2) NO llegó ningún diagrama (missing).
+    diagram_obj = result.get("diagram") or {}
+    new_b64 = (diagram_obj.get("svg_b64") or "").strip()
+    prev_b64 = memory_get(user_id, "last_svg_b64", "").strip()
+
+    wants_that_asr_diagram = _wants_diagram_of_that_asr(message)
+    missing = (not diagram_obj) or (not diagram_obj.get("data_uri"))
+
+    if wants_that_asr_diagram or missing:
+        current_asr = memory_get(user_id, "current_asr", "")
+        combo_text = (f"{message}\n\n{current_asr}").strip()
+        puml = _build_component_puml_from_text(combo_text, title_hint=f"ASR Diagram [{message_id}]")
+        ok, payload, err = render_kroki_sync("plantuml", puml, output_format="svg")
+        if ok and payload:
+            svg_b64 = base64.b64encode(payload).decode("ascii")
+            diagram_obj = {
+                "ok": True,
+                "diagram_type": "plantuml",
+                "format": "svg",
+                "svg_b64": svg_b64,
+                "data_uri": f"data:image/svg+xml;base64,{svg_b64}",
+                "message": None,
+                "source_echo": puml,
+            }
+            new_b64 = svg_b64
+        else:
+            diagram_obj = {
+                "ok": False,
+                "diagram_type": "plantuml",
+                "format": "svg",
+                "svg_b64": None,
+                "data_uri": None,
+                "message": err or "Kroki render error (fallback)",
+                "source_echo": puml,
+            }
+            new_b64 = ""
+
+    # Guarda el último solo si hay algo nuevo
+    if new_b64:
+        memory_set(user_id, "last_svg_b64", new_b64)
+
+    # --- Payload al front (no pisamos suggestions si las necesitas) ---
     clean_payload = {
-        "endMessage": result.get("endMessage", ""),
+        "endMessage": end_msg,
         "mermaidCode": result.get("mermaidCode", ""),
-        "messages": result.get("turn_messages", []),  # solo los internos de este turno
+        "diagram": diagram_obj,                # <- usa diagram.data_uri o svg_b64 en el front
+        "messages": result.get("turn_messages", []),
         "session_id": session_id,
         "message_id": message_id,
+        "thread_id": thread_id,
         "suggestions": result.get("suggestions", []),
     }
     return clean_payload

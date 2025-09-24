@@ -38,7 +38,6 @@ const titleFrom = (text) => {
   return firstLine || "New chat";
 };
 
-// storage helpers
 const loadSessions = () => {
   try { return JSON.parse(localStorage.getItem(STORAGE_KEYS.SESSIONS) || "[]"); } catch { return []; }
 };
@@ -48,7 +47,6 @@ const loadChat = (sid) => {
 };
 const saveChat = (sid, msgs) => localStorage.setItem(STORAGE_KEYS.MESSAGES(sid), JSON.stringify(msgs));
 
-/* Parse “Next:” fallback si el backend no envía suggestions[] */
 const parseNextFromText = (text = "") => {
   const m = text.match(/^\s*Next:\s*([\s\S]*)$/im);
   if (!m) return [];
@@ -56,7 +54,6 @@ const parseNextFromText = (text = "") => {
     .split("\n")
     .map((ln) => ln.replace(/^[\s\-•]+/, "").trim())
     .filter(Boolean);
-  // corta en el primer bloque vacío
   const cleaned = [];
   for (const ln of lines) {
     if (!ln) break;
@@ -66,7 +63,6 @@ const parseNextFromText = (text = "") => {
   return cleaned;
 };
 
-/* RAG helpers para el modal */
 const summarizeRoles = (internal = []) => {
   const counts = new Map();
   const order = ["supervisor", "researcher", "evaluator", "creator", "asr_recommender", "unifier"];
@@ -91,7 +87,44 @@ const extractRagSources = (internal = []) => {
   return out;
 };
 
-/* ======================= Assistant bubble (Markdown sin HTML crudo) ======================= */
+/* ========= helpers para SVG ========= */
+const toB64 = (s) => {
+  try { return btoa(unescape(encodeURIComponent(String(s)))); } catch { return ""; }
+};
+
+/** Devuelve un data-uri si encuentra:
+ *  1) data:image/svg+xml;base64,....
+ *  2) data:image/svg+xml;utf8,<svg ...>...</svg>
+ *  3) un bloque <svg>...</svg> crudo en el texto
+ */
+const extractSvgDataUrlFromText = (text = "") => {
+  const s = String(text || "");
+
+  // 1) data:image/svg+xml;base64,...
+  const mB64Full = s.match(/data:image\/svg\+xml;base64,[A-Za-z0-9+/=]+/);
+  if (mB64Full) return mB64Full[0];
+
+  // 2) data:image/svg+xml;utf8,<svg ...>...</svg>  (o ;charset=utf8)
+  const mUtf8 = s.match(/data:image\/svg\+xml;[^,]*,([\s\S]+?)["')\s]/);
+  if (mUtf8 && mUtf8[1] && mUtf8[1].includes("<svg")) {
+    const svg = decodeURIComponent(mUtf8[1]);
+    if (svg.includes("</svg>")) {
+      return `data:image/svg+xml;base64,${toB64(svg)}`;
+    }
+  }
+
+  // 3) bloque <svg>...</svg> crudo en el markdown
+  const i1 = s.indexOf("<svg");
+  const i2 = s.indexOf("</svg>");
+  if (i1 !== -1 && i2 !== -1 && i2 > i1) {
+    const svg = s.slice(i1, i2 + "</svg>".length);
+    return `data:image/svg+xml;base64,${toB64(svg)}`;
+  }
+
+  return null;
+};
+
+/* ======================= Assistant bubble (Markdown sin imágenes) ======================= */
 function AssistantMessage({ text, pending }) {
   if (pending) {
     return (
@@ -105,7 +138,10 @@ function AssistantMessage({ text, pending }) {
   }
   return (
     <Box className="assistant-message prose prose-invert max-w-none" sx={{ color: "white" }}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{ img: () => null }} // <- no permitir <img> del markdown
+      >
         {text || ""}
       </ReactMarkdown>
     </Box>
@@ -114,7 +150,6 @@ function AssistantMessage({ text, pending }) {
 
 /* ======================= Chat ======================= */
 export default function Chat() {
-  // Drawer (escucha al header global)
   const [drawerOpen, setDrawerOpen] = useState(false);
   useEffect(() => {
     const handler = () => setDrawerOpen((p) => !p);
@@ -122,11 +157,9 @@ export default function Chat() {
     return () => window.removeEventListener("arquia-toggle-drawer", handler);
   }, []);
 
-  // Sessions
   const [sessions, setSessions] = useState(loadSessions());
   const [sessionId, setSessionId] = useState(() => sessions?.[0]?.id || uuid());
 
-  // Chat state
   const [messages, setMessages] = useState(() => loadChat(sessionId));
   const [input, setInput] = useState("");
   const [attachedImages, setAttachedImages] = useState([]);
@@ -137,7 +170,6 @@ export default function Chat() {
   const fileInputRef = useRef(null);
   const requestSeq = useRef(0);
 
-  // ¿hay respuesta pendiente? -> bloquea UI
   const isBusy = useMemo(() => messages.some((m) => m.pending), [messages]);
 
   useEffect(() => {
@@ -152,7 +184,6 @@ export default function Chat() {
 
   useEffect(() => { setMessages(loadChat(sessionId)); }, [sessionId]);
 
-  // sessions ops
   const createSession = () => {
     if (isBusy) return;
     const id = uuid();
@@ -180,9 +211,8 @@ export default function Chat() {
     }
   };
 
-  // ------- envío ----------
   const sendMessage = async (overrideText) => {
-    if (isBusy) return; // bloquear envío cuando está “pensando”
+    if (isBusy) return;
 
     const textToSend = (overrideText ?? input).trim();
     if (!textToSend && attachedImages.length === 0) return;
@@ -207,7 +237,6 @@ export default function Chat() {
     form.append("session_id", sessionId);
     attachedImages.forEach((img, index) => form.append(`image${index + 1}`, img.file));
 
-    // limpiar input/adjuntos
     setInput("");
     setAttachedImages([]);
     if (fileInputRef.current) fileInputRef.current.value = "";
@@ -218,7 +247,6 @@ export default function Chat() {
       const data = await resp.json();
       if (seq !== requestSeq.current) return;
 
-      // usamos texto tal cual del backend (Answer/References/Next)
       const textOut = data?.endMessage || "—";
 
       const rendered = optimistic.map((m) =>
@@ -234,7 +262,7 @@ export default function Chat() {
               diagram: data?.diagram || null,
               suggestions: Array.isArray(data?.suggestions) && data?.suggestions.length > 0
                 ? data.suggestions
-                : parseNextFromText(textOut) // fallback si no vino el array
+                : parseNextFromText(textOut)
             }
           : m
       );
@@ -250,13 +278,8 @@ export default function Chat() {
     }
   };
 
-  // chips -> manda la sugerencia como prompt
-  const onSuggestionClick = (sugg) => {
-    if (isBusy) return;
-    sendMessage(sugg);
-  };
+  const onSuggestionClick = (sugg) => { if (!isBusy) sendMessage(sugg); };
 
-  // feedback
   const handleThumbClick = (sid, mid, thumbs_up, thumbs_down) => {
     const form = new FormData();
     form.append("session_id", sid);
@@ -272,7 +295,6 @@ export default function Chat() {
     handleThumbClick(sid, mid, isUp ? 1 : 0, isUp ? 0 : 1);
   };
 
-  // images
   const handleImageUpload = (e) => {
     if (isBusy) return;
     const files = Array.from(e.target.files);
@@ -283,7 +305,6 @@ export default function Chat() {
   };
   const removeImage = (i) => { if (!isBusy) setAttachedImages((p) => p.filter((_, idx) => idx !== i)); };
 
-  /* ======================= UI ======================= */
   const bubbleSx = (isUser) => ({
     width: "100%",
     borderRadius: 12,
@@ -297,7 +318,6 @@ export default function Chat() {
   const headerSx = { display: "flex", alignItems: "center", justifyContent: "space-between", mb: 1 };
   const headerTitle = (msg) => (msg.sender === "usuario" ? "Tú" : msg.pending ? "Asistente (pensando…)" : "Asistente");
 
-  // Drawer UI
   const DrawerContent = (
     <Box sx={{ width: 300, height: "100%", background: "#151515", color: "#fff", display: "flex", flexDirection: "column" }}>
       <Box sx={{ px: 2, py: 1.5, borderBottom: "1px solid rgba(255,255,255,0.08)" }}>
@@ -368,23 +388,40 @@ export default function Chat() {
           {messages.map((msg) => {
             const isUser = msg.sender === "usuario";
 
-            // 1) Construye un data URL desde diagram.svg_b64 o desde el HTML del texto
-            const diagramDataUrl = !isUser
-              ? (
-                  (msg?.diagram?.ok && msg?.diagram?.svg_b64)
-                    ? `data:image/svg+xml;base64,${msg.diagram.svg_b64}`
-                    : ((msg.text || "").match(/data:image\/svg\+xml;base64,[A-Za-z0-9+/=]+/)?.[0] || null)
-                )
-              : null;
+            // === Resolución ROBUSTA del SVG ===
+            let diagramSrc = null;
+            if (!isUser) {
+              const d = msg?.diagram || {};
+              if (d && d.ok) {
+                if (d.data_uri) diagramSrc = d.data_uri;
+                else if (d.svg_b64) diagramSrc = `data:image/svg+xml;base64,${d.svg_b64}`;
+                else if (d.svg_text) diagramSrc = `data:image/svg+xml;base64,${toB64(d.svg_text)}`;
+              }
+              // Fallbacks a texto del asistente
+              if (!diagramSrc) {
+                const fromText = extractSvgDataUrlFromText(msg.text || "");
+                if (fromText) diagramSrc = fromText;
+              }
+            }
 
-            // 2) Evita que ReactMarkdown intente renderizar <img> rotos
+            // Limpieza de imágenes del markdown para evitar <img src=""> rotos
             const cleanedAssistantText = !isUser
-              ? (msg.text || "").replace(/<img[^>]*>/gi, "")
+              ? String(msg.text || "")
+                  .replace(/<img[^>]*>/gi, "")
+                  .replace(/!\[[^\]]*]\([^)]*\)/g, "")
+                  .replace(/!\[[^\]]*]/g, "")
               : (msg.text || "");
 
             const roles = !isUser ? summarizeRoles(msg.internal_messages) : [];
             const ragSources = !isUser ? extractRagSources(msg.internal_messages) : [];
             const ratedKey = `${msg.session_id}-${msg.message_id}`;
+
+            console.debug("diagram-debug", {
+              messageId: msg.message_id,
+              hasDiagram: !!msg.diagram,
+              ok: msg?.diagram?.ok,
+              usedSrc: !!diagramSrc
+            });
 
             return (
               <ListItem key={msg.id} disableGutters sx={{ mb: 2 }}>
@@ -430,10 +467,10 @@ export default function Chat() {
                   )}
 
                   {/* Render del diagrama SVG si existe */}
-                  {!isUser && diagramDataUrl && (
+                  {!isUser && diagramSrc && (
                     <Box sx={{ mt: 1.5 }}>
                       <img
-                        src={diagramDataUrl}
+                        src={diagramSrc}
                         alt="diagram"
                         style={{
                           maxWidth: "100%",
@@ -460,7 +497,6 @@ export default function Chat() {
                     </Box>
                   )}
 
-                  {/* Chips “Next” */}
                   {!isUser && Array.isArray(msg.suggestions) && msg.suggestions.length > 0 && (
                     <>
                       <Divider sx={{ my: 1.2, opacity: 0.08 }} />
@@ -485,7 +521,6 @@ export default function Chat() {
                     </>
                   )}
 
-                  {/* Roles y rating */}
                   {!isUser && (roles.length > 0 || (msg.session_id && msg.message_id)) && (
                     <Divider sx={{ my: 1.2, opacity: 0.08 }} />
                   )}
@@ -540,7 +575,6 @@ export default function Chat() {
         </Stack>
       )}
 
-      {/* Input + acciones */}
       <Box className="input-container">
         <TextField
           className="input-field"
@@ -568,7 +602,6 @@ export default function Chat() {
         </Button>
       </Box>
 
-      {/* Modal: mensajes internos */}
       <Dialog
         className="nodes-dialog"
         open={openDialog}
