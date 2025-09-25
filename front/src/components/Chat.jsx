@@ -19,6 +19,9 @@ import ChatBubbleOutlineIcon from "@mui/icons-material/ChatBubbleOutline";
 import ScienceIcon from "@mui/icons-material/Science";
 import "../styles/chat.css";
 
+/* ======================= Config ======================= */
+const API = import.meta.env.VITE_API_BASE || "http://localhost:8000";
+
 /* ======================= Utils ======================= */
 const uuid = () =>
   (crypto?.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random()));
@@ -87,7 +90,7 @@ const extractRagSources = (internal = []) => {
   return out;
 };
 
-/* ========= helpers para SVG ========= */
+/* ========= helpers para SVG/PNG/PDF ========= */
 const toB64 = (s) => {
   try { return btoa(unescape(encodeURIComponent(String(s)))); } catch { return ""; }
 };
@@ -104,7 +107,7 @@ const extractSvgDataUrlFromText = (text = "") => {
   const mB64Full = s.match(/data:image\/svg\+xml;base64,[A-Za-z0-9+/=]+/);
   if (mB64Full) return mB64Full[0];
 
-  // 2) data:image/svg+xml;utf8,<svg ...>...</svg>  (o ;charset=utf8)
+  // 2) data:image/svg+xml;utf8,<svg ...>...</svg>
   const mUtf8 = s.match(/data:image\/svg\+xml;[^,]*,([\s\S]+?)["')\s]/);
   if (mUtf8 && mUtf8[1] && mUtf8[1].includes("<svg")) {
     const svg = decodeURIComponent(mUtf8[1]);
@@ -124,13 +127,44 @@ const extractSvgDataUrlFromText = (text = "") => {
   return null;
 };
 
+/* ========= Intento de diagrama NL ========= */
+const hasDiagramIntent = (t = "") =>
+  /\b(diagrama|diagram|plantuml|mermaid|despliegue|deployment)\b/i.test(t);
+
+async function renderDiagramFromNL(naturalPrompt, outputFormat = "svg") {
+  const res = await fetch(`${API}/diagram/nl`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt: naturalPrompt, output_format: outputFormat })
+  });
+
+  const ct = res.headers.get("content-type") || "";
+  if (!res.ok) {
+    const err = ct.includes("application/json") ? await res.json() : { detail: `HTTP ${res.status}` };
+    throw new Error(err.detail || "Render error");
+  }
+
+  if (ct.includes("image/svg")) {
+    const text = await res.text();
+    return { ok: true, data_uri: `data:image/svg+xml;base64,${toB64(text)}`, svg_text: text };
+  }
+  const blob = await res.blob();
+  if (ct.includes("image/png")) {
+    return { ok: true, data_uri: URL.createObjectURL(blob), kind: "png" };
+  }
+  if (ct.includes("application/pdf")) {
+    return { ok: true, data_uri: URL.createObjectURL(blob), kind: "pdf" };
+  }
+  return { ok: false, error: `Unsupported content-type: ${ct}` };
+}
+
 /* ======================= Assistant bubble (Markdown sin imágenes) ======================= */
 function AssistantMessage({ text, pending }) {
   if (pending) {
     return (
       <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
         <CircularProgress size={16} />
-        <Typography variant="caption" sx={{ color: "##CFD8DC" }}>
+        <Typography variant="caption" sx={{ color: "#CFD8DC" }}>
           generating response…
         </Typography>
       </Box>
@@ -243,11 +277,22 @@ export default function Chat() {
 
     const seq = ++requestSeq.current;
     try {
-      const resp = await fetch("http://localhost:8000/message", { method: "POST", body: form });
+      // 1) Llama al endpoint clásico de conversación
+      const resp = await fetch(`${API}/message`, { method: "POST", body: form });
       const data = await resp.json();
       if (seq !== requestSeq.current) return;
 
       const textOut = data?.endMessage || "—";
+
+      // 2) Intento de render NL si el usuario pidió diagrama explícitamente
+      let diagram = null;
+      if (hasDiagramIntent(textToSend)) {
+        try {
+          diagram = await renderDiagramFromNL(textToSend, "svg");
+        } catch (e) {
+          console.warn("NL diagram render failed:", e);
+        }
+      }
 
       const rendered = optimistic.map((m) =>
         m.id === pendingId
@@ -259,7 +304,7 @@ export default function Chat() {
               mermaidCode: data?.mermaidCode || "",
               session_id: data?.session_id || sessionId,
               message_id: data?.message_id,
-              diagram: data?.diagram || null,
+              diagram: diagram || data?.diagram || null,
               suggestions: Array.isArray(data?.suggestions) && data?.suggestions.length > 0
                 ? data.suggestions
                 : parseNextFromText(textOut)
@@ -286,7 +331,7 @@ export default function Chat() {
     form.append("message_id", mid);
     form.append("thumbs_up", thumbs_up);
     form.append("thumbs_down", thumbs_down);
-    fetch("http://localhost:8000/feedback", { method: "POST", body: form });
+    fetch(`${API}/feedback`, { method: "POST", body: form });
   };
   const handleRating = (sid, mid, isUp) => {
     const key = `${sid}-${mid}`;
@@ -415,13 +460,6 @@ export default function Chat() {
             const roles = !isUser ? summarizeRoles(msg.internal_messages) : [];
             const ragSources = !isUser ? extractRagSources(msg.internal_messages) : [];
             const ratedKey = `${msg.session_id}-${msg.message_id}`;
-
-            console.debug("diagram-debug", {
-              messageId: msg.message_id,
-              hasDiagram: !!msg.diagram,
-              ok: msg?.diagram?.ok,
-              usedSrc: !!diagramSrc
-            });
 
             return (
               <ListItem key={msg.id} disableGutters sx={{ mb: 2 }}>
