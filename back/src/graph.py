@@ -1,11 +1,18 @@
-# ========== Imports 
+from __future__ import annotations
+
+# ========== Imports
 
 # Util
 from typing import Annotated, Literal
 from typing_extensions import TypedDict
 from pathlib import Path
-import os, re, json, sqlite3
+import os, re, json, sqlite3, base64, logging
 from dotenv import load_dotenv, find_dotenv
+
+# HTTP
+import requests
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
 
 # LangChain / LangGraph
 from langchain_openai import ChatOpenAI
@@ -15,18 +22,23 @@ from langgraph.graph.message import add_messages
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.prebuilt import create_react_agent
 
-# GCP (solo si usas vision para comparar diagramas/imagenes)
-from vertexai.generative_models import GenerativeModel
-from vertexai.preview.generative_models import Image
+# (Opcional) GCP Vision for image compare – protegido con try/except
+try:
+    from vertexai.generative_models import GenerativeModel
+    from vertexai.preview.generative_models import Image
+    _HAS_VERTEX = True
+except Exception:
+    _HAS_VERTEX = False
 
 # RAG / citas
 from src.rag_agent import get_retriever
-from src.quoting import pack_quotes, render_quotes_md
+# (estos pueden no usarse siempre, pero se conservan)
+try:
+    from src.quoting import pack_quotes, render_quotes_md
+except Exception:
+    pack_quotes = render_quotes_md = None
 
-# Kroki
-from src.diagram_agent import diagram_node
-
-# --- Token utils (soft) ---
+# ========== Token utils (soft) ==========
 try:
     import tiktoken
     _enc = tiktoken.encoding_for_model("gpt-4o")
@@ -40,7 +52,6 @@ except Exception:
 def _clip_text(text: str, max_tokens: int) -> str:
     if _count_tokens(text) <= max_tokens:
         return text
-    # recorta por caracteres hasta aproximar
     target_chars = max(100, int(max_tokens * 3))  # 3 chars/token aprox
     return (text or "")[:target_chars] + "…"
 
@@ -62,6 +73,10 @@ def _last_k_messages(msgs, k=6):
 
 load_dotenv(dotenv_path=find_dotenv('.env.development'))
 
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+log = logging.getLogger("graph")
+
 BASE_DIR = Path(__file__).resolve().parent.parent  # back/
 STATE_DIR = BASE_DIR / "state_db"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -70,8 +85,129 @@ DB_PATH = STATE_DIR / "example.db"
 conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
 sqlite_saver = SqliteSaver(conn)
 
-llm = ChatOpenAI(model="gpt-4o")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+llm = ChatOpenAI(model=OPENAI_MODEL, temperature=0)
 retriever = get_retriever()
+
+# ========== Diagrams backend endpoints / modos
+
+# Nota: evita llamar al mismo puerto 8000 (mismo proceso) para no bloquear el bucle.
+DIAGRAM_BASE = os.getenv("DIAGRAM_BASE", "http://127.0.0.1:8001").rstrip("/")
+DIAGRAM_NL_MODE = os.getenv("DIAGRAM_NL_MODE", "fallback").lower()  # off | fallback | always
+DIAGRAM_FORMAT = os.getenv("DIAGRAM_FORMAT", "svg")  # svg | png | pdf
+DIAGRAM_INPROC = os.getenv("DIAGRAM_INPROC", "0") == "1"  # intenta uso en-proceso (si disponible)
+
+# Sesión HTTP con retries y timeouts
+def _make_http() -> requests.Session:
+    s = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=0.5,
+        connect=3,
+        read=3,
+        status=3,
+        status_forcelist=(502, 503, 504),
+        allowed_methods=frozenset(["GET","POST"]),
+        raise_on_status=False
+    )
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    s.headers.update({"User-Agent": "ArchIA/diagram-orchestrator"})
+    return s
+
+_HTTP = _make_http()
+
+# ========== PlantUML helper (LLM)
+
+PLANTUML_SYSTEM = """You are an expert software architect and PlantUML author.
+Convert the user's natural-language request into a PlantUML DEPLOYMENT diagram.
+
+HARD RULES:
+- Output ONLY PlantUML between @startuml and @enduml (no prose, no code fences).
+- ASCII only (no « », →, ↔, …). Use <<stereotypes>> and -> arrows.
+- Prefer compact structure: cloud "Internet", node "k8s cluster" as cluster, package "namespace" { ... }.
+- Use 'database' for DBs, 'queue' for brokers if needed, 'folder' for volumes.
+- Prefer relationships even if the user didn't specify them explicitly (infer reasonable ones):
+  Ingress -> Services; Services -> Deployments/Pods; Deployments -> DB/Cache; Workers -> DB/Cache/Queues.
+- Annotate ports and replicas in labels when provided (e.g., "api (8000) replicas=3").
+- Keep output readable.
+"""
+
+_UNICODE_FIXES = [
+    (r"```+plantuml|```+puml|```+", ""),
+    (r"«", "<<"), (r"»", ">>"),
+    (r"→|⇒|↦", "->"), (r"↔|⇄|⟷", "<->"),
+    (r"—|–", "-"), (r"\u00A0", " ")
+]
+
+def _sanitize_puml(s: str) -> str:
+    s = (s or "").strip()
+    for pat, rep in _UNICODE_FIXES:
+        s = re.sub(pat, rep, s, flags=re.IGNORECASE)
+    if "@startuml" not in s:
+        s = "@startuml\n" + s
+    if "@enduml" not in s:
+        s = s + "\n@enduml"
+    if "skinparam componentStyle" not in s:
+        s = s.replace(
+            "@startuml",
+            "@startuml\nskinparam componentStyle uml2\nskinparam wrapWidth 200"
+        )
+    return s
+
+def _llm_nl_to_puml(natural_prompt: str) -> str:
+    msgs = [SystemMessage(content=PLANTUML_SYSTEM),
+            HumanMessage(content=natural_prompt)]
+    resp = llm.invoke(msgs)
+    raw = getattr(resp, "content", str(resp))
+    return _sanitize_puml(raw)
+
+# ========== Backends de render
+
+def _render_nl_with_backend(uq: str, fmt: str = DIAGRAM_FORMAT) -> dict:
+    url = f"{DIAGRAM_BASE}/diagram/nl"
+    try:
+        r = _HTTP.post(url, json={"prompt": uq, "output_format": fmt}, timeout=(5, 180))
+        if r.status_code == 200:
+            b64 = base64.b64encode(r.content).decode("ascii")
+            ctype = r.headers.get("content-type", "image/svg+xml")
+            return {"ok": True, "svg_b64": b64, "content_type": ctype}
+        return {"ok": False, "error": f"{r.status_code}: {r.text[:200]}"}
+    except requests.Timeout as e:
+        return {"ok": False, "error": f"NL backend timeout: {e}"}
+    except Exception as e:
+        return {"ok": False, "error": f"NL backend error: {e}"}
+
+def _render_puml_with_backend(puml: str, fmt: str = DIAGRAM_FORMAT) -> dict:
+    url = f"{DIAGRAM_BASE}/diagram/render"
+    payload = {"diagram_type": "plantuml", "source": puml, "output_format": fmt}
+    try:
+        r = _HTTP.post(url, json=payload, timeout=(5, 180))
+        if r.status_code == 200:
+            b64 = base64.b64encode(r.content).decode("ascii")
+            ctype = r.headers.get("content-type", "image/svg+xml")
+            return {"ok": True, "svg_b64": b64, "content_type": ctype}
+        return {"ok": False, "error": f"{r.status_code}: {r.text[:200]}"}
+    except requests.Timeout as e:
+        return {"ok": False, "error": f"Render backend timeout: {e}"}
+    except Exception as e:
+        return {"ok": False, "error": f"Render backend error: {e}"}
+
+# In-proc (opcional)
+def _render_inproc_puml(puml: str, fmt: str = DIAGRAM_FORMAT) -> dict:
+    """Render en-proceso si tienes un cliente local disponible (evita HTTP loopback)."""
+    if not DIAGRAM_INPROC:
+        return {"ok": False, "error": "in-proc disabled"}
+    try:
+        # Si tienes un cliente local para Kroki/PlantUML, con esta interfaz:
+        # from src.clients.kroki_client import render_plantuml
+        from src.clients.kroki_client import render_plantuml  # type: ignore
+        svg_bytes = render_plantuml(puml, fmt=fmt)  # debe devolver bytes
+        b64 = base64.b64encode(svg_bytes).decode("ascii")
+        return {"ok": True, "svg_b64": b64, "content_type": "image/svg+xml"}
+    except Exception as e:
+        return {"ok": False, "error": f"in-proc render error: {e}"}
 
 # ========== Estado
 
@@ -91,8 +227,8 @@ class GraphState(TypedDict):
     endMessage: str
     mermaidCode: str
 
-    hasVisitedDiagram: bool  # Kroki
-    diagram: dict            # output del nodo diagram_agent
+    hasVisitedDiagram: bool
+    diagram: dict
 
     # buffers / RAG / memoria liviana
     turn_messages: list
@@ -101,8 +237,8 @@ class GraphState(TypedDict):
     suggestions: list
 
     # memoria de conversación útil
-    last_asr: str  # <— nuevo: último ASR generado en este hilo
-    asr_sources_list: list  
+    last_asr: str
+    asr_sources_list: list
 
     # control de idioma/intención/forcing RAG
     language: Literal["en","es"]
@@ -131,10 +267,7 @@ supervisorSchema = {
     "description": "Response from the supervisor indicating the next node and the setup question.",
     "type": "object",
     "properties": {
-        "localQuestion": {
-            "type": "string",
-            "description": "What is the question for the worker node?"
-        },
+        "localQuestion": {"type": "string", "description": "What is the question for the worker node?"},
         "nextNode": {
             "type": "string",
             "description": "The next node to act.",
@@ -178,14 +311,34 @@ investigatorSchema = {
     "required": ["definition", "useCases", "examples"]
 }
 
-# ========== Heurísticas de idioma e intenciones de follow-up
-# --- ASR evaluation helpers (colócalos cerca de classify_followup) ---
-def _looks_like_eval(text: str) -> bool:
+# ========== Heurísticas de idioma e intenciones
+
+FOLLOWUP_PATTERNS = [
+    ("explain_tactics", r"\b(tactics?|tácticas?).*(explain|describe|detalla|explica)|explica.*tácticas"),
+    ("make_asr",        r"\b(asr|architecture significant requirement).*(make|create|example|ejemplo)|ejemplo.*asr"),
+    ("component_view",  r"\b(component|diagrama de componentes|component diagram)"),
+    ("deployment_view", r"\b(deployment|despliegue|deployment view)"),
+    ("functional_view", r"\b(functional view|vista funcional)"),
+    ("compare",         r"\b(compare|comparar).*?(latency|scalability|availability)"),
+    ("checklist",       r"\b(checklist|lista de verificación|lista de verificacion)"),
+]
+
+def detect_lang(text: str) -> str:
     t = (text or "").lower()
-    return any(k in t for k in [
-        "evaluate this asr", "evalúa este asr", "evaluar este asr",
-        "check this asr", "revisa este asr", "review this asr"
-    ])
+    es_hits = sum(w in t for w in ["qué","que","cómo","como","por qué","porque","cuál","cual","hola","táctica","tactica","vista","despliegue"])
+    en_hits = sum(w in t for w in ["what","how","why","which","hello","tactic","view","deployment","component"])
+    if es_hits > en_hits: return "es"
+    if en_hits > es_hits: return "en"
+    return "en"
+
+def classify_followup(question: str) -> str | None:
+    q = (question or "").lower().strip()
+    for intent, pat in FOLLOWUP_PATTERNS:
+        if re.search(pat, q):
+            return intent
+    return None
+
+# ========== ASR helpers
 
 EVAL_TRIGGERS = [
     "evaluate this asr", "check this asr", "review this asr",
@@ -193,6 +346,10 @@ EVAL_TRIGGERS = [
     "es bueno este asr", "mejorar este asr", "mejorar asr",
     "critique this asr", "assess this asr"
 ]
+
+def _looks_like_eval(text: str) -> bool:
+    t = (text or "").lower()
+    return any(k in t for k in EVAL_TRIGGERS)
 
 def _wants_asr_evaluation(text: str) -> bool:
     t = (text or "").lower()
@@ -224,81 +381,6 @@ def _extract_candidate_asr(state: GraphState) -> str:
     if last:
         return last
 
-    mem = state.get("memory_text", "") or ""
-    mm = re.search(r"\[LAST_ASR\]\s*(.+)$", mem, flags=re.S)
-    if mm:
-        return mm.group(1).strip()
-
-    return uq.strip()
-
-FOLLOWUP_PATTERNS = [
-    ("explain_tactics", r"\b(tactics?|tácticas?).*(explain|describe|detalla|explica)|explica.*tácticas"),
-    ("make_asr",        r"\b(asr|architecture significant requirement).*(make|create|example|ejemplo)|ejemplo.*asr"),
-    ("component_view",  r"\b(component|diagrama de componentes|component diagram)"),
-    ("deployment_view", r"\b(deployment|despliegue|deployment view)"),
-    ("functional_view", r"\b(functional view|vista funcional)"),
-    ("compare",         r"\b(compare|comparar).*?(latency|scalability|availability)"),
-    ("checklist",       r"\b(checklist|lista de verificación|lista de verificacion)"),
-]
-
-def detect_lang(text: str) -> str:
-    t = (text or "").lower()
-    es_hits = sum(w in t for w in ["qué","que","cómo","como","por qué","porque","cuál","cual","hola","táctica","tactica","vista","despliegue"])
-    en_hits = sum(w in t for w in ["what","how","why","which","hello","tactic","view","deployment","component"])
-    if es_hits > en_hits: return "es"
-    if en_hits > es_hits: return "en"
-    return "en"
-
-def classify_followup(question: str) -> str | None:
-    q = (question or "").lower().strip()
-    for intent, pat in FOLLOWUP_PATTERNS:
-        if re.search(pat, q):
-            return intent
-    return None
-# --- ASR evaluate helpers ---
-EVAL_TRIGGERS = [
-    "evaluate this asr", "check this asr", "review this asr",
-    "evalúa este asr", "evalua este asr", "revisa este asr",
-    "es bueno este asr", "mejorar este asr", "mejorar asr",
-    "critique this asr", "assess this asr"
-]
-
-def _wants_asr_evaluation(text: str) -> bool:
-    t = (text or "").lower()
-    if "asr" in t and any(k in t for k in EVAL_TRIGGERS):
-        return True
-    # también si el usuario pregunta "can you check/evaluate" y menciona "asr"
-    if any(k in t for k in ["evaluate", "check", "review", "evalúa", "evalua", "revisa"]) and "asr" in t:
-        return True
-    # si pega un “ASR:” explícito
-    if "asr:" in t:
-        return True
-    return False
-
-def _extract_candidate_asr(state: GraphState) -> str:
-    """
-    1) Si el usuario pegó un ASR explícito en el mensaje, úsalo.
-    2) Si no, usa el último ASR generado en este chat (state['last_asr'] o en memory_text).
-    3) En última instancia, usa la cadena del usuario (por si escribió una sola frase).
-    """
-    uq = state.get("userQuestion", "") or ""
-    # si viene anotado con ASR:
-    m = re.search(r"(?:^|\n)\s*ASR\s*:?(.*)$", uq, flags=re.I | re.S)
-    if m:
-        cand = m.group(1).strip()
-        if cand:
-            return cand
-    # si hay comillas/líneas cortas, intenta eso
-    q_lines = [ln.strip() for ln in uq.splitlines() if ln.strip()]
-    if len(q_lines) == 1 and len(q_lines[0]) <= 200:
-        return q_lines[0]
-
-    # memoria del turno
-    last = state.get("last_asr") or ""
-    if last:
-        return last
-
-    # memory_text (fallback)
     mem = state.get("memory_text", "") or ""
     mm = re.search(r"\[LAST_ASR\]\s*(.+)$", mem, flags=re.S)
     if mm:
@@ -348,7 +430,6 @@ def _push_turn(state: GraphState, role: str, name: str, content: str) -> None:
 def _reset_turn(state: GraphState) -> GraphState:
     return {**state, "turn_messages": []}
 
-# ========== Tools (investigator / RAG / vision)
 # ========== Tools (investigator / RAG / vision / evaluator) ==========
 from langchain_core.tools import tool
 
@@ -360,8 +441,9 @@ def LLM(prompt: str) -> dict:
 
 @tool
 def LLMWithImages(image_path: str) -> str:
-    """Analiza diagramas de arquitectura en imágenes.
-    Enfócate en tácticas de performance/disponibilidad y patrones de diseño cuando aplique."""
+    """Analiza diagramas de arquitectura en imágenes (si Vertex AI está disponible)."""
+    if not _HAS_VERTEX:
+        return "Image analysis unavailable: Vertex AI SDK not installed."
     image = Image.load_from_file(image_path)
     generative_multimodal_model = GenerativeModel("gemini-1.0-pro-vision")
     resp = generative_multimodal_model.generate_content([
@@ -386,12 +468,12 @@ def local_RAG(prompt: str) -> str:
                      "scalability tactics", "architectural tactics performance"]
 
     queries = [q] + [f"{q} — {s}" for s in synonyms]
-    seen, docs_all = set(), []
+    docs_all = []
     for qq in queries:
         try:
             for d in retriever.invoke(qq):
-                # ...
-                if len(docs_all) >= 8:  # <-- antes 12
+                docs_all.append(d)
+                if len(docs_all) >= 8:
                     break
         except Exception:
             pass
@@ -417,7 +499,7 @@ def local_RAG(prompt: str) -> str:
 
     return "\n\n".join(preview) + "\n\nSOURCES:\n" + "\n".join(src_lines)
 
-# ===== Evaluator tools (con docstrings) =====
+# ===== Evaluator tools =====
 EVAL_THEORY_PREFIX = (
     "You are assessing the theoretical correctness of a proposed software architecture "
     "(patterns, tactics, views, styles). Be specific and concise."
@@ -436,37 +518,35 @@ ANALYZE_PREFIX = (
 
 @tool
 def theory_tool(prompt: str) -> dict:
-    """Evalúa corrección teórica vs buenas prácticas (patrones, tácticas, vistas).
-    Retorna dict con keys: positiveAspects, negativeAspects, suggestions."""
+    """Evalúa corrección teórica vs buenas prácticas (patrones, tácticas, vistas)."""
     return llm.with_structured_output(evaluatorSchema).invoke(
         f"{EVAL_THEORY_PREFIX}\n\nUser input:\n{prompt}"
     )
 
 @tool
 def viability_tool(prompt: str) -> dict:
-    """Evalúa viabilidad (coste, complejidad, operatividad, riesgos).
-    Retorna dict con keys: positiveAspects, negativeAspects, suggestions."""
+    """Evalúa viabilidad (coste, complejidad, operatividad, riesgos)."""
     return llm.with_structured_output(evaluatorSchema).invoke(
         f"{EVAL_VIABILITY_PREFIX}\n\nUser input:\n{prompt}"
     )
 
 @tool
 def needs_tool(prompt: str) -> dict:
-    """Valida alineación con necesidades/ASRs y traza decisiones a requerimientos.
-    Retorna dict con keys: positiveAspects, negativeAspects, suggestions."""
+    """Valida alineación con necesidades/ASRs y traza decisiones a requerimientos."""
     return llm.with_structured_output(evaluatorSchema).invoke(
         f"{EVAL_NEEDS_PREFIX}\n\nUser input:\n{prompt}"
     )
 
 @tool
 def analyze_tool(image_path: str, image_path2: str) -> str:
-    """Compara dos diagramas de arquitectura (p. ej., class vs component) y valora impacto en atributos de calidad."""
+    """Compara dos diagramas de arquitectura (si Vertex AI está disponible)."""
+    if not _HAS_VERTEX:
+        return "Diagram compare unavailable: Vertex AI SDK not installed."
     image = Image.load_from_file(image_path)
     image2 = Image.load_from_file(image_path2)
     generative_multimodal_model = GenerativeModel("gemini-1.0-pro-vision")
     resp = generative_multimodal_model.generate_content([ANALYZE_PREFIX, image, image2])
     return str(resp)
-
 
 # ========== Router
 
@@ -486,8 +566,72 @@ def router(state: GraphState) -> Literal["investigator", "creator", "evaluator",
     else:
         return "unifier"
 
+# ========== Nodo: Orquestador de diagramas (NL → render / LLM→PUML→render) ==========
 
-# ========== Nodos
+def diagram_orchestrator_node(state: "GraphState") -> "GraphState":
+    """
+    Orquesta: NL parser del backend  y/o LLM->PlantUML->render.
+    - DIAGRAM_NL_MODE=off:       solo backend /diagram/nl
+    - DIAGRAM_NL_MODE=always:    siempre LLM -> /diagram/render (fallback a /nl si falta flechas)
+    - DIAGRAM_NL_MODE=fallback:  intenta /nl; si falla, usa LLM -> /render (y como 3er fallback, in-proc si existe)
+    """
+    uq = state.get("localQuestion") or state.get("userQuestion") or ""
+    mode = DIAGRAM_NL_MODE
+
+    def _ok(res: dict) -> bool:
+        return bool(res and res.get("ok") and res.get("svg_b64"))
+
+    # 1) Modo off → solo NL backend
+    if mode == "off":
+        res = _render_nl_with_backend(uq)
+        state["diagram"] = res
+        state["hasVisitedDiagram"] = True
+        return state
+
+    # 2) Modo always → LLM→PUML→render (fallback a NL y/o in-proc)
+    if mode == "always":
+        try:
+            puml = _llm_nl_to_puml(uq)
+            if ("->" not in puml) and ("-->" not in puml):
+                res = _render_nl_with_backend(uq)
+                if not _ok(res) and DIAGRAM_INPROC:
+                    res = _render_inproc_puml(puml)
+            else:
+                res = _render_puml_with_backend(puml)
+                if not _ok(res) and DIAGRAM_INPROC:
+                    res = _render_inproc_puml(puml)
+                if not _ok(res):
+                    res2 = _render_nl_with_backend(uq)
+                    if _ok(res2): res = res2
+        except Exception as e:
+            log.warning("LLM->PUML failed: %s", e)
+            res = _render_nl_with_backend(uq)
+        state["diagram"] = res
+        state["hasVisitedDiagram"] = True
+        return state
+
+    # 3) Modo fallback (recomendado)
+    nl = _render_nl_with_backend(uq)
+    if _ok(nl):
+        state["diagram"] = nl
+        state["hasVisitedDiagram"] = True
+        return state
+
+    # NL falló → LLM→PUML
+    try:
+        puml = _llm_nl_to_puml(uq)
+        res = _render_puml_with_backend(puml)
+        if not _ok(res) and DIAGRAM_INPROC:
+            res = _render_inproc_puml(puml)
+    except Exception as e:
+        res = {"ok": False, "error": f"LLM/Render error: {e}"}
+
+    state["diagram"] = res
+    state["hasVisitedDiagram"] = True
+    return state
+
+# ========== Nodos principales ==========
+
 def supervisor_node(state: GraphState):
     uq = (state.get("userQuestion") or "")
 
@@ -503,19 +647,19 @@ def supervisor_node(state: GraphState):
     fu_intent = classify_followup(uq)
     if _looks_like_eval(uq):
         return {**state,
-                "localQuestion": uq,      # pasamos el texto tal cual
+                "localQuestion": uq,
                 "nextNode": "evaluator",
                 "intent": "architecture",
                 "language": state_lang}
+
     # keywords para diagramas (ES/EN)
     diagram_terms = [
         "diagrama", "diagrama de componentes", "diagrama de arquitectura",
         "diagram", "component diagram", "architecture diagram",
-        "mermaid", "plantuml", "c4", "bpmn", "uml"
+        "mermaid", "plantuml", "c4", "bpmn", "uml", "despliegue", "deployment"
     ]
     wants_diagram = any(t in uq.lower() for t in diagram_terms)
 
-    # ✅ renombrado: antes se llamaba `message`
     sys_messages = [SystemMessage(content=makeSupervisorPrompt(state))]
 
     # baseline LLM (con fallback defensivo)
@@ -550,8 +694,6 @@ def supervisor_node(state: GraphState):
         "language": state_lang
     }
 
-# --- Helpers comunes para ASR ---
-
 def _sanitize_plain_text(txt: str) -> str:
     txt = re.sub(r"```.*?```", "", txt, flags=re.S)
     txt = txt.replace("**", "")
@@ -572,7 +714,6 @@ def _dedupe_snippets(docs_list, max_items=3, max_chars=400) -> str:
             break
     return "\n\n".join(out)
 
-# --- ASR node ---
 def asr_node(state: GraphState) -> GraphState:
     lang = state.get("language", "es")
     uq = state.get("userQuestion", "") or ""
@@ -592,14 +733,13 @@ def asr_node(state: GraphState) -> GraphState:
     else:
         domain = "e-commerce flash sale"
 
-    # === Recupera fragmentos de los libros (RAG) ===
+    # === RAG ===
     try:
         query = f"{concern} quality attribute scenario latency measure stimulus environment artifact response measure"
         docs_raw = list(retriever.invoke(query))
-        docs_list = docs_raw[:6]  # <-- duro tope
+        docs_list = docs_raw[:6]
     except Exception:
         docs_list = []
-
 
     book_snippets = _dedupe_snippets(docs_list, max_items=6, max_chars=800)
 
@@ -651,7 +791,7 @@ Validation plan:
     result = llm.invoke(prompt)
     content = _sanitize_plain_text(getattr(result, "content", str(result)))
 
-    # === Bloque de fuentes (construir SIEMPRE antes de usar) ===
+    # === Bloque de fuentes ===
     src_lines = []
     for d in (docs_list or []):
         md = d.metadata or {}
@@ -661,22 +801,11 @@ Validation plan:
         page_str = f" (p.{page})" if page is not None else ""
         src_lines.append(f"- {title}{page_str} — {path}")
 
-    # Evita duplicados y limita a 8
-        # evita saturar: máximo 4 líneas y cada una capada
     if src_lines:
-        src_lines = [ _clip_text(s, 60) for s in src_lines ]  # corta cada línea
+        src_lines = [_clip_text(s, 60) for s in src_lines]
         src_lines = list(dict.fromkeys(src_lines))[:4]
 
-
     src_block = "SOURCES:\n" + ("\n".join(src_lines) if src_lines else "- (no local sources)")
-
-    # Lista de refs (para memoria/unifier)
-    refs_list = []
-    for line in src_block.splitlines():
-        line = line.strip()
-        if not line or line.lower().startswith("sources"):
-            continue
-        refs_list.append(line.lstrip("- ").strip())
 
     # Traza para el modal + mensajes
     state["turn_messages"] = state.get("turn_messages", []) + [
@@ -689,15 +818,14 @@ Validation plan:
         AIMessage(content=src_block, name="asr_sources"),
     ]
 
-    # === MEMORIA DEL CHAT: guarda último ASR + refs ===
+    # === MEMORIA DEL CHAT ===
     state["last_asr"] = content
+    refs_list = [ln.lstrip("- ").strip() for ln in src_block.splitlines() if ln.strip() and not ln.lower().startswith("sources")]
     state["asr_sources_list"] = refs_list
     prev_mem = state.get("memory_text", "") or ""
     state["memory_text"] = (prev_mem + f"\n\n[LAST_ASR]\n{content}\n").strip()
 
     return {**state, "hasVisitedASR": True}
-
-# --- Investigator (researcher) ---
 
 def researcher_node(state: GraphState) -> GraphState:
     lang = state.get("language", "es")
@@ -721,7 +849,9 @@ def researcher_node(state: GraphState) -> GraphState:
     system_message = SystemMessage(content=sys)
     _push_turn(state, role="system", name="researcher_system", content=sys)
 
-    tools = [local_RAG, LLM, LLMWithImages]
+    tools = [local_RAG, LLM]
+    if _HAS_VERTEX:
+        tools.append(LLMWithImages)
     agent = create_react_agent(llm, tools=tools)
 
     # HINT corto
@@ -733,7 +863,6 @@ def researcher_node(state: GraphState) -> GraphState:
 
     hint = _clip_text("\n".join(hint_lines).strip(), 100) if hint_lines else ""
 
-    # <<< CAMBIO CRÍTICO: recorta historial >>>
     short_history = _last_k_messages(state["messages"], k=6)
     messages_with_system = [system_message] + short_history
     payload = {
@@ -744,15 +873,11 @@ def researcher_node(state: GraphState) -> GraphState:
         "imagePath2": state["imagePath2"]
     }
 
-    # fallback por rate limit de TPM
     try:
         result = agent.invoke(payload)
-    except Exception as e:
-        # reintento mínimo: sin hint y con k=3
+    except Exception:
         messages_with_system = [system_message] + _last_k_messages(state["messages"], k=3)
         payload["messages"] = messages_with_system
-        if "messages" in payload and hint:
-            payload["messages"] = messages_with_system  # sin hint
         result = agent.invoke(payload)
 
     for msg in result["messages"]:
@@ -764,10 +889,8 @@ def researcher_node(state: GraphState) -> GraphState:
         "hasVisitedInvestigator": True
     }
 
-# --- Creator ---
 def creator_node(state: GraphState) -> GraphState:
     user_q = state["userQuestion"]
-    # prefiera localQuestion si trae el ASR embebido por el supervisor
     effective_q = state.get("localQuestion") or user_q
 
     prompt = f"""{prompt_creator}
@@ -782,7 +905,6 @@ If an ASR is provided, ensure components and connectors explicitly support the R
     response = llm.invoke(prompt)
     content = getattr(response, "content", "")
 
-    # Si sigues con Mermaid:
     match = re.search(r"```mermaid\s*(.*?)```", content, re.DOTALL | re.IGNORECASE)
     mermaid_code = (match.group(1).strip() if match else "").strip()
 
@@ -795,43 +917,19 @@ If an ASR is provided, ensure components and connectors explicitly support the R
         "hasVisitedCreator": True
     }
 
-
-# --- Evaluator ---
-# --- Helpers para evaluación de ASR (parches mínimos) ---
-
-def _looks_like_eval(text: str) -> bool:
-    t = (text or "").lower()
-    return any(k in t for k in ["evaluate this asr", "evalúa este asr", "evaluar este asr", "check this asr", "revisa este asr", "review this asr"])
-
 def _pick_asr_to_evaluate(state: GraphState) -> str:
-    """
-    1) Si hay un ASR reciente en memoria del chat, úsalo.
-    2) Si el usuario pegó 'Evaluate this ASR: ...', extrae ese bloque.
-    3) Fallback: último mensaje del 'asr_recommender' si existe.
-    4) Si nada, devuelve cadena vacía.
-    """
-    # 1) memoria liviana
     if state.get("last_asr"):
         return state["last_asr"]
-
-    # 2) extracción directa desde la pregunta del usuario
     uq = (state.get("userQuestion") or "")
     m = re.search(r"(evaluate|evalúa|evaluar|check|review)\s+(this|este)\s+asr\s*:?\s*(.+)$", uq, re.I | re.S)
     if m:
         return m.group(3).strip()
-
-    # 3) último mensaje del nodo asr_recommender
     for m in reversed(state.get("messages", [])):
         if isinstance(m, AIMessage) and (m.name or "") == "asr_recommender" and m.content:
             return m.content
-
     return ""
 
 def _book_snippets_for_eval(retriever, concern_hint: str = "") -> str:
-    """
-    Recupera pocas frases cortas para no disparar tokens.
-    Limita a 4 fragmentos de 300 chars cada uno.
-    """
     q = "quality attribute scenario parts stimulus source environment artifact response response measure"
     if concern_hint:
         q = concern_hint + " " + q
@@ -839,7 +937,15 @@ def _book_snippets_for_eval(retriever, concern_hint: str = "") -> str:
         docs = list(retriever.invoke(q))
     except Exception:
         docs = []
-    return _dedupe_snippets(docs, max_items=4, max_chars=300)  # ya tienes _dedupe_snippets arriba
+    # 4 fragmentos de 300 chars c/u
+    seen, out = set(), []
+    for d in docs:
+        t = (d.page_content or "").strip().replace("\n", " ")
+        t = t[:300]
+        if t and t not in seen:
+            seen.add(t); out.append(t)
+        if len(out) >= 4: break
+    return "\n\n".join(out)
 
 def getEvaluatorPrompt(image_path1: str, image_path2: str) -> str:
     i1 = f"\nthis is the first image path: {image_path1}" if image_path1 else ""
@@ -853,13 +959,6 @@ Use:
 Keep answers short and decisive."""
 
 def evaluator_node(state: GraphState) -> GraphState:
-    """
-    Modo 1 (nuevo): si el usuario pide evaluar un ASR, hacemos evaluación directa, usando RAG,
-    y devolvemos una respuesta compacta con veredicto, gaps y una versión reescrita del ASR.
-
-    Modo 2 (fallback): si NO es evaluación de ASR, usamos tu agente anterior (theory/viability/needs/analyze)
-    tal cual para no romper nada.
-    """
     lang = state.get("language", "es")
     uq = (state.get("userQuestion") or "")
     concern_hint = "latency" if re.search(r"latenc", uq, re.I) else ("scalability" if re.search(r"scalab", uq, re.I) else "")
@@ -873,7 +972,6 @@ def evaluator_node(state: GraphState) -> GraphState:
             _push_turn(state, role="assistant", name="evaluator", content=short)
             return {**state, "messages": state["messages"] + [AIMessage(content=short, name="evaluator")], "hasVisitedEvaluator": True}
 
-        # RAG: trocitos cortos de los libros para fundamentar
         book_snips = _book_snippets_for_eval(retriever, concern_hint)
 
         directive = "Responde en español." if lang=="es" else "Answer in English."
@@ -909,7 +1007,6 @@ References:
         result = llm.invoke(eval_prompt)
         content = getattr(result, "content", str(result)).strip()
 
-        # traza para el modal + mensajes
         _push_turn(state, role="system", name="evaluator_system", content=eval_prompt)
         _push_turn(state, role="assistant", name="evaluator", content=content)
 
@@ -919,8 +1016,11 @@ References:
             "hasVisitedEvaluator": True
         }
 
-    # --- MODO 2 (fallback): comportamiento original con tools ---
-    evaluator_agent = create_react_agent(llm, tools=[theory_tool, viability_tool, needs_tool, analyze_tool])
+    # --- MODO 2 (fallback): tools variados ---
+    tools = [theory_tool, viability_tool, needs_tool]
+    if _HAS_VERTEX:
+        tools.append(analyze_tool)
+    evaluator_agent = create_react_agent(llm, tools=tools)
 
     eval_prompt = getEvaluatorPrompt(state.get("imagePath1",""), state.get("imagePath2",""))
     _push_turn(state, role="system", name="evaluator_system", content=eval_prompt)
@@ -1014,7 +1114,7 @@ Next:
         state["suggestions"] = tips
         return {**state, "endMessage": end_text, "intent": "diagram"}
 
-    # 1) Caso especial: ASR -> entrega tal cual + referencias + next
+    # 1) Caso especial: ASR
     if intent == "asr":
         last_asr = _last_ai_by(state, "asr_recommender") or "No ASR content found for this turn."
         asr_src_txt = _last_ai_by(state, "asr_sources")
@@ -1063,7 +1163,6 @@ Next:
     if researcher_txt:
         rag_refs = _extract_rag_sources_from(researcher_txt) or ""
 
-
     memory_hint = state.get("memory_text", "")
 
     buckets = []
@@ -1071,9 +1170,6 @@ Next:
     if evaluator_txt:  buckets.append(f"evaluator:\n{evaluator_txt}")
     if creator_txt and intent == "diagram": buckets.append(f"creator:\n{creator_txt}")
     if asr_src_txt: buckets.append(f"asr_sources:\n{asr_src_txt}")
-    
-
-    # luego construyes synthesis_source como ya lo tienes
 
     synthesis_source = "User question:\n" + (state.get("userQuestion","")) + "\n\n" + "\n\n".join(buckets)
 
@@ -1172,9 +1268,7 @@ def boot_node(state: GraphState) -> GraphState:
         "mermaidCode": "",
         "diagram": {},
         "endMessage": "",
-        # last_asr se conserva para que el siguiente turno pueda usarlo
     }
-
 
 # ========== Wiring
 
@@ -1182,7 +1276,7 @@ builder.add_node("classifier", classifier_node)
 builder.add_node("supervisor", supervisor_node)
 builder.add_node("investigator", researcher_node)
 builder.add_node("creator", creator_node)
-builder.add_node("diagram_agent", diagram_node)  # Kroki
+builder.add_node("diagram_agent", diagram_orchestrator_node)  # Orquestador
 builder.add_node("evaluator", evaluator_node)
 builder.add_node("unifier", unifier_node)
 builder.add_node("asr", asr_node)
@@ -1194,7 +1288,7 @@ builder.add_edge("classifier", "supervisor")
 builder.add_conditional_edges("supervisor", router)
 builder.add_edge("investigator", "supervisor")
 builder.add_edge("creator", "supervisor")
-builder.add_edge("diagram_agent", "supervisor")  # Kroki
+builder.add_edge("diagram_agent", "supervisor")
 builder.add_edge("evaluator", "supervisor")
 builder.add_edge("asr", "supervisor")
 builder.add_edge("unifier", END)
