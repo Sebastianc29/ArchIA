@@ -11,7 +11,13 @@ from .routers.diagram import router as diagram_router
 from langchain_core.messages import HumanMessage
 from src.graph import graph
 from src.rag_agent import create_or_load_vectorstore
-from src.memory import init as memory_init, get as memory_get, set_kv as memory_set
+from src.memory import (
+    init as memory_init,
+    get as memory_get,
+    set_kv as memory_set,
+    load_arch_flow,
+    save_arch_flow,
+)
 from src.clients.kroki_client import render_kroki_sync  # <- para el fallback
 
 memory_init()
@@ -244,6 +250,7 @@ async def message(
 
     # Identidad simple por sesión
     user_id = request.headers.get("X-User-Id") or session_id
+    arch_flow = load_arch_flow(user_id)
 
     # ID incremental para feedback por mensaje
     message_id = get_next_message_id(session_id)
@@ -338,6 +345,10 @@ async def message(
                 "force_rag": force_rag,
                 "topic_hint": topic_hint,
                 "current_asr": memory_get(user_id, "current_asr", ""),
+                "arch_stage": arch_flow.get("stage", ""),
+                "quality_attribute": arch_flow.get("quality_attribute", ""),
+                "add_context": arch_flow.get("add_context", ""),
+                "tactics_list": arch_flow.get("tactics", []),
             },
             config,
         )
@@ -365,6 +376,23 @@ async def message(
         memory_set(user_id, "current_asr", asr_from_result)
     elif made_asr and len(end_msg) > 80:
         memory_set(user_id, "current_asr", end_msg.strip())
+
+    # Actualizar arch_flow con el ASR generado/refinado
+    if result.get("hasVisitedASR"):
+        # texto final del ASR que vamos a recordar siempre
+        arch_flow["current_asr"] = memory_get(user_id, "current_asr", "")
+        # atributo de calidad detectado por asr_node (latency, availability, etc.)
+        arch_flow["quality_attribute"] = result.get(
+            "asr_quality_attribute",
+            arch_flow.get("quality_attribute", "")
+        )
+        # contexto / dominio del sistema (e-commerce, API pública...)
+        arch_flow["add_context"] = result.get(
+            "asr_context",
+            arch_flow.get("add_context", "")
+        )
+        # hemos alcanzado formalmente la etapa ASR
+        arch_flow["stage"] = "ASR"
 
     # ===================== DIAGRAMA =====================
     # Usa el diagrama que venga del agente. SOLO usa fallback si:
@@ -410,6 +438,16 @@ async def message(
     if new_b64:
         memory_set(user_id, "last_svg_b64", new_b64)
 
+    #si ya obtuvimos un diagrama de despliegue, lo persistimos ----
+    if diagram_obj and diagram_obj.get("svg_b64"):
+        arch_flow["deployment_diagram_puml"] = diagram_obj.get("source_echo", "")
+        arch_flow["deployment_diagram_svg_b64"] = diagram_obj.get("svg_b64", "")
+        # asumimos que este diagrama representa la implementación del ASR
+        arch_flow["stage"] = "DEPLOYMENT"
+    
+    # Persistimos el estado ADD 3.0 actualizado
+    save_arch_flow(user_id, arch_flow)
+    
     # --- Payload al front (no pisamos suggestions si las necesitas) ---
     clean_payload = {
         "endMessage": end_msg,
@@ -421,6 +459,7 @@ async def message(
         "thread_id": thread_id,
         "suggestions": result.get("suggestions", []),
     }
+
     return clean_payload
 
 # ===================== /feedback ========================

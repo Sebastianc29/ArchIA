@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 # ========== Imports
 
 # Util
@@ -245,6 +244,11 @@ class GraphState(TypedDict):
     intent: Literal["general","greeting","smalltalk","architecture","diagram","asr"]
     force_rag: bool
 
+    # etapa actual del pipeline ASR -> tacticas -> despliegue
+    arch_stage:str
+    quality_attribute:str
+    add_context:str
+    tactics_list:list
 
 class AgentState(TypedDict):
     messages: list
@@ -824,6 +828,11 @@ Validation plan:
     state["asr_sources_list"] = refs_list
     prev_mem = state.get("memory_text", "") or ""
     state["memory_text"] = (prev_mem + f"\n\n[LAST_ASR]\n{content}\n").strip()
+    #exponer metadata clave del ASR para que el main la persista
+    #domain, el dominio / contexto funcional que asumimos 
+    state["asr_quality_atribute"] = concern
+    state["asr_context"] = domain
+    state["asr_text"] = content
 
     return {**state, "hasVisitedASR": True}
 
