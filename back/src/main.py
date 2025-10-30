@@ -172,6 +172,27 @@ def _wants_diagram_of_that_asr(msg: str) -> bool:
     mentions_that_asr = any(k in low for k in ["that asr", "ese asr", "esa asr", "dicho asr", "ese requisito"])
     return (wants_diagram and mentions_that_asr) or (mentions_component and mentions_that_asr)
 
+def _wants_tactics(txt: str) -> bool:
+    low = (txt or "").lower()
+    keys = [
+        "táctica", "tactica", "tácticas", "tacticas",
+        "tactic", "tactics",
+        "estrategia", "estrategias", "strategy", "strategies",
+        "cómo cumplir", "como cumplir",
+        "how to satisfy", "how to meet", "how to achieve"
+    ]
+    return any(k in low for k in keys)
+
+def _wants_deployment(txt: str) -> bool:
+    low = (txt or "").lower()
+    keys = [
+        "despliegue", "deployment", "deployment diagram",
+        "diagrama de despliegue",
+        "plantuml", "mermaid"
+    ]
+    return any(k in low for k in keys)
+
+
 # ====== Fallback builder (solo cuando lo piden o falta) ======
 def _build_component_puml_from_text(text: str, title_hint: str = "") -> str:
     t = (text or "").lower()
@@ -307,6 +328,20 @@ async def message(
         ))
     )
 
+    user_intent = "general"
+    if not arch_flow.get("current_asr"):
+        # No hay ASR en memoria -> el primer turno DEBE ser ASR
+        user_intent = "asr"
+    elif _wants_tactics(message):
+        user_intent = "tactics"
+    elif _wants_deployment(message):
+        user_intent = "diagram"
+
+    if user_intent == "asr":
+        force_rag = False
+
+    # Config del grafo (baja el límite mientras pruebas)
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 20}
     # --- Limpieza parcial del estado (sin borrar historial) ---
     try:
         graph.update_state(config, {"values": {
@@ -341,7 +376,7 @@ async def message(
                 "memory_text": memory_text,
                 "suggestions": [],
                 "language": user_lang,
-                "intent": "general",
+                "intent": user_intent,
                 "force_rag": force_rag,
                 "topic_hint": topic_hint,
                 "current_asr": memory_get(user_id, "current_asr", ""),
@@ -394,6 +429,14 @@ async def message(
         # hemos alcanzado formalmente la etapa ASR
         arch_flow["stage"] = "ASR"
 
+    # --- Persistir tácticas si este turno fue de tácticas ---
+    tactics_json = result.get("tactics_struct") or None
+    tactics_md   = result.get("tactics_md") or ""
+
+    if user_intent == "tactics" and (tactics_json or tactics_md):
+        arch_flow["tactics"] = tactics_json or []   # guarda estructura si vino
+        arch_flow["stage"] = "TACTICS"
+    
     # ===================== DIAGRAMA =====================
     # Usa el diagrama que venga del agente. SOLO usa fallback si:
     #   (1) el usuario pidió “diagram ... of that ASR”, o
@@ -403,9 +446,8 @@ async def message(
     prev_b64 = memory_get(user_id, "last_svg_b64", "").strip()
 
     wants_that_asr_diagram = _wants_diagram_of_that_asr(message)
-    missing = (not diagram_obj) or (not diagram_obj.get("data_uri"))
 
-    if wants_that_asr_diagram or missing:
+    if wants_that_asr_diagram:
         current_asr = memory_get(user_id, "current_asr", "")
         combo_text = (f"{message}\n\n{current_asr}").strip()
         puml = _build_component_puml_from_text(combo_text, title_hint=f"ASR Diagram [{message_id}]")
@@ -440,11 +482,14 @@ async def message(
 
     #si ya obtuvimos un diagrama de despliegue, lo persistimos ----
     if diagram_obj and diagram_obj.get("svg_b64"):
+        # Guarda el diagrama renderizado
         arch_flow["deployment_diagram_puml"] = diagram_obj.get("source_echo", "")
         arch_flow["deployment_diagram_svg_b64"] = diagram_obj.get("svg_b64", "")
-        # asumimos que este diagrama representa la implementación del ASR
+
+    # Solo marcamos DEPLOYMENT si el usuario pidió despliegue explícitamente
+    if _wants_deployment(message):
         arch_flow["stage"] = "DEPLOYMENT"
-    
+        
     # Persistimos el estado ADD 3.0 actualizado
     save_arch_flow(user_id, arch_flow)
     

@@ -117,6 +117,32 @@ def _make_http() -> requests.Session:
 
 _HTTP = _make_http()
 
+
+# ========== Tatctics helpes
+TACTICS_HEADINGS = [
+    r"design tactics(?: to consider)?",
+    r"tácticas(?: de diseño)?",
+    r"arquitectural tactics",
+    r"decisiones (?:arquitectónicas|de diseño)",
+]
+
+def _strip_tactics_sections(md: str) -> str:
+    if not md:
+        return md
+    text = md
+    for h in TACTICS_HEADINGS:
+        text = re.sub(rf"(?is)\n+\s*{h}\s*:?.*$", "\n", text)
+    return text.strip()
+
+def _extract_first_json_block(md: str):
+    m = re.search(r"```json\s*(\{.*?\}|\[.*?\])\s*```", md, re.S|re.I)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))
+    except Exception:
+        return None
+
 # ========== PlantUML helper (LLM)
 
 PLANTUML_SYSTEM = """You are an expert software architect and PlantUML author.
@@ -218,7 +244,7 @@ class GraphState(TypedDict):
     hasVisitedCreator: bool
     hasVisitedEvaluator: bool
     hasVisitedASR: bool
-    nextNode: Literal["investigator", "creator", "evaluator", "asr", "unifier"]
+    nextNode: Literal["investigator", "creator", "evaluator", "diagram_agent", "tactics", "asr", "unifier"]
 
     imagePath1: str
     imagePath2: str
@@ -241,7 +267,7 @@ class GraphState(TypedDict):
 
     # control de idioma/intención/forcing RAG
     language: Literal["en","es"]
-    intent: Literal["general","greeting","smalltalk","architecture","diagram","asr"]
+    intent: Literal["general","greeting","smalltalk","architecture","diagram","asr","tactics"]
     force_rag: bool
 
     # etapa actual del pipeline ASR -> tacticas -> despliegue
@@ -249,6 +275,9 @@ class GraphState(TypedDict):
     quality_attribute:str
     add_context:str
     tactics_list:list
+    current_asr: str #ASR vigente
+    tactics_md: str #salida markdonw del tactics_node
+    tactics_struct: list #salida JSON parseada del tactics_node
 
 class AgentState(TypedDict):
     messages: list
@@ -264,7 +293,7 @@ builder = StateGraph(GraphState)
 
 class supervisorResponse(TypedDict):
     localQuestion: Annotated[str, ..., "What is the question for the worker node?"]
-    nextNode: Literal["investigator", "creator", "evaluator", "asr", "unifier"]
+    nextNode: Literal["investigator", "creator", "evaluator", "diagram_agent", "tactics", "asr", "unifier"]
 
 supervisorSchema = {
     "title": "SupervisorResponse",
@@ -275,7 +304,7 @@ supervisorSchema = {
         "nextNode": {
             "type": "string",
             "description": "The next node to act.",
-            "enum": ["investigator", "creator", "evaluator", "unifier", "asr"]
+            "enum": ["investigator", "creator", "evaluator", "unifier", "asr", "diagram_agent", "tactics"]
         }
     },
     "required": ["localQuestion", "nextNode"]
@@ -554,11 +583,13 @@ def analyze_tool(image_path: str, image_path2: str) -> str:
 
 # ========== Router
 
-def router(state: GraphState) -> Literal["investigator", "creator", "evaluator", "diagram_agent", "asr", "unifier"]:
+def router(state: GraphState) -> Literal["investigator","creator","evaluator","diagram_agent","tactics","asr","unifier"]:
     if state["nextNode"] == "unifier":
         return "unifier"
     elif state["nextNode"] == "asr" and not state.get("hasVisitedASR", False):
         return "asr"
+    elif state["nextNode"] == "tactics":
+        return "tactics"
     elif state["nextNode"] == "investigator" and not state["hasVisitedInvestigator"]:
         return "investigator"
     elif state["nextNode"] == "creator" and not state["hasVisitedCreator"]:
@@ -648,7 +679,31 @@ def supervisor_node(state: GraphState):
     lang = detect_lang(uq)
     state_lang = "es" if lang == "es" else "en"
 
+    # ✅ CORTE DE CIRCUITO: respeta la intención forzada desde main.py
+    forced = state.get("intent")
+    if forced == "asr":
+        return {**state,
+                "localQuestion": f"Create a concrete QAS (ASR) for: {uq}",
+                "nextNode": "asr",
+                "intent": "asr",
+                "language": state_lang}
+    if forced == "tactics":
+        return {**state,
+                "localQuestion": ("Propose architecture tactics to satisfy the previous ASR. "
+                                  "Explain why each tactic helps and ties to the ASR response/measure."),
+                "nextNode": "tactics",
+                "intent": "tactics",
+                "language": state_lang}
+    if forced == "diagram":
+        return {**state,
+                "localQuestion": uq,
+                "nextNode": "diagram_agent",
+                "intent": "diagram",
+                "language": state_lang}
+
+    # (a partir de aquí, SOLO si no vino intención forzada)
     fu_intent = classify_followup(uq)
+
     if _looks_like_eval(uq):
         return {**state,
                 "localQuestion": uq,
@@ -656,13 +711,22 @@ def supervisor_node(state: GraphState):
                 "intent": "architecture",
                 "language": state_lang}
 
-    # keywords para diagramas (ES/EN)
+    # keywords para DIAGRAMAS (ES/EN)
     diagram_terms = [
         "diagrama", "diagrama de componentes", "diagrama de arquitectura",
         "diagram", "component diagram", "architecture diagram",
         "mermaid", "plantuml", "c4", "bpmn", "uml", "despliegue", "deployment"
     ]
     wants_diagram = any(t in uq.lower() for t in diagram_terms)
+
+    # NEW: keywords para TÁCTICAS (ES/EN)
+    tactics_terms = [
+        "táctica", "tácticas", "tactic", "tactics",
+        "estrategia", "estrategias", "strategy", "strategies",
+        "cómo cumplir", "como cumplir", "how to satisfy",
+        "how to meet", "how to achieve"
+    ]
+    wants_tactics = any(t in uq.lower() for t in tactics_terms)  # NEW
 
     sys_messages = [SystemMessage(content=makeSupervisorPrompt(state))]
 
@@ -675,12 +739,30 @@ def supervisor_node(state: GraphState):
         next_node, local_q = "investigator", uq
 
     intent_val = state.get("intent", "general")
+
+    # 1) ASR primero (no incluir tácticas aquí)
     if any(x in uq.lower() for x in ["asr", "quality attribute scenario", "qas"]) or fu_intent == "make_asr":
-        next_node = "asr"; intent_val = "asr"; local_q = f"Create a concrete QAS (ASR) for: {state['userQuestion']}"
-    elif wants_diagram or fu_intent in ("component_view","deployment_view","functional_view"):
-        next_node = "diagram_agent"; intent_val = "diagram"; local_q = uq
-    elif fu_intent in ("explain_tactics","compare","checklist"):
-        next_node = "investigator"; intent_val = "architecture"
+        next_node = "asr"
+        intent_val = "asr"
+        local_q = f"Create a concrete QAS (ASR) for: {state['userQuestion']}"
+
+    # 2) DIAGRAMA cuando lo piden
+    elif wants_diagram or fu_intent in ("component_view", "deployment_view", "functional_view"):
+        next_node = "diagram_agent"
+        intent_val = "diagram"
+        local_q = uq
+
+    # 3) NEW: TÁCTICAS solo cuando el usuario las pide
+    elif wants_tactics or fu_intent in ("explain_tactics", "tactics"):  # NEW
+        next_node = "tactics"                 # ⬅️ asegúrate de registrar este nodo
+        intent_val = "tactics"
+        local_q = ("Propose architecture tactics to satisfy the previous ASR. "
+                   "Explain why each tactic helps and how it ties to the ASR response/measure.")  # NEW
+
+    # 4) Resto
+    elif fu_intent in ("compare", "checklist"):
+        next_node = "investigator"
+        intent_val = "architecture"
 
     # evita unifier si no se visitó nada este turno
     if next_node == "unifier" and not (
@@ -697,6 +779,8 @@ def supervisor_node(state: GraphState):
         "intent": intent_val,
         "language": state_lang
     }
+
+
 
 def _sanitize_plain_text(txt: str) -> str:
     txt = re.sub(r"```.*?```", "", txt, flags=re.S)
@@ -737,13 +821,15 @@ def asr_node(state: GraphState) -> GraphState:
     else:
         domain = "e-commerce flash sale"
 
-    # === RAG ===
-    try:
-        query = f"{concern} quality attribute scenario latency measure stimulus environment artifact response measure"
-        docs_raw = list(retriever.invoke(query))
-        docs_list = docs_raw[:6]
-    except Exception:
-        docs_list = []
+    # === RAG (saltable) ===
+    docs_list = []
+    if state.get("force_rag", False):
+        try:
+            query = f"{concern} quality attribute scenario latency measure stimulus environment artifact response measure"
+            docs_raw = list(retriever.invoke(query))
+            docs_list = docs_raw[:6]
+        except Exception:
+            docs_list = []
 
     book_snippets = _dedupe_snippets(docs_list, max_items=6, max_chars=800)
 
@@ -759,7 +845,7 @@ CRITICAL:
 - In Response Measure, prefer SLO style (p95/p99 latency, throughput) with concrete numbers.
 
 BOOK_SNIPPETS:
-{book_snippets}
+{book_snippets or "(none)"}
 
 Project/domain: {domain}
 User input: {uq}
@@ -779,23 +865,14 @@ Scenario:
   Artifact:
   Response:
   Response Measure:
-
-Design tactics to consider:
-  - 6–10 tactics explicitly named (e.g., replication, partitioning/sharding, caching, async processing, backpressure, coarse-grained operations, connection pooling, request shedding, load balancing, elastic scaling).
-
-Trade-offs & risks:
-  - 3–6 bullets.
-
-Acceptance criteria:
-  - 3–5 checks.
-
-Validation plan:
-  - 3–5 bullets.
 """
     result = llm.invoke(prompt)
-    content = _sanitize_plain_text(getattr(result, "content", str(result)))
+    content_raw = getattr(result, "content", str(result))
+    content = _sanitize_plain_text(content_raw)
+    # quita secciones de tácticas si el modelo las metió
+    content = _strip_tactics_sections(content)
 
-    # === Bloque de fuentes ===
+    # === Fuentes (si hubo RAG) ===
     src_lines = []
     for d in (docs_list or []):
         md = d.metadata or {}
@@ -804,14 +881,13 @@ Validation plan:
         path  = md.get("source_path") or md.get("source") or ""
         page_str = f" (p.{page})" if page is not None else ""
         src_lines.append(f"- {title}{page_str} — {path}")
-
     if src_lines:
         src_lines = [_clip_text(s, 60) for s in src_lines]
         src_lines = list(dict.fromkeys(src_lines))[:4]
 
     src_block = "SOURCES:\n" + ("\n".join(src_lines) if src_lines else "- (no local sources)")
 
-    # Traza para el modal + mensajes
+    # Traza + memoria de turno
     state["turn_messages"] = state.get("turn_messages", []) + [
         {"role": "system", "name": "asr_system", "content": prompt},
         {"role": "assistant", "name": "asr_recommender", "content": content},
@@ -822,38 +898,197 @@ Validation plan:
         AIMessage(content=src_block, name="asr_sources"),
     ]
 
-    # === MEMORIA DEL CHAT ===
+    # Memoria viva del chat
     state["last_asr"] = content
     refs_list = [ln.lstrip("- ").strip() for ln in src_block.splitlines() if ln.strip() and not ln.lower().startswith("sources")]
     state["asr_sources_list"] = refs_list
     prev_mem = state.get("memory_text", "") or ""
     state["memory_text"] = (prev_mem + f"\n\n[LAST_ASR]\n{content}\n").strip()
-    #exponer metadata clave del ASR para que el main la persista
-    #domain, el dominio / contexto funcional que asumimos 
-    state["asr_quality_atribute"] = concern
+
+    # Exponer metadata clave del ASR para que main.py la persista (ojo al typo)
+    state["asr_quality_attribute"] = concern           # corregido
     state["asr_context"] = domain
     state["asr_text"] = content
 
-    return {**state, "hasVisitedASR": True}
+    # Señales para cortar el turno y NO volver a investigar
+    state["endMessage"] = content
+    state["hasVisitedASR"] = True
+    state["force_rag"] = False
+    state["nextNode"] = "unifier"                      # cierra en unifier
+
+    return state
+
+def _strip_code_block_json(md: str) -> str:
+    # Remueve el primer bloque ```json ... ``` si existe (dejamos solo el Markdown legible)
+    return re.sub(r"```json\s.*?```", "", md, flags=re.S | re.I).strip()
+
+def _guess_quality_attribute(text: str) -> str:
+    low = (text or "").lower()
+    if "latenc" in low or "response time" in low: return "latency"
+    if "scalab" in low or "throughput" in low:    return "scalability"
+    if "availab" in low or "uptime" in low:       return "availability"
+    if "secur" in low:                             return "security"
+    if "modifiab" in low or "change" in low:       return "modifiability"
+    if "reliab" in low or "fault" in low:          return "reliability"
+    return "performance"
+
+def tactics_node(state: GraphState) -> GraphState:
+    lang = state.get("language", "es")
+    directive = "Answer in English." if lang == "en" else "Responde en español."
+
+    # 1) Tomamos el ASR actual (o lo inferimos del mensaje)
+    asr_text = state.get("asr_text") or state.get("last_asr") or ""
+    if not asr_text:
+        uq = state.get("userQuestion", "") or ""
+        m = re.search(r"(?:^|\n)\s*ASR\s*:\s*(.+)$", uq, flags=re.I | re.S)
+        asr_text = (m.group(1).strip() if m else uq.strip())
+
+    # 2) Deducimos el atributo de calidad
+    qa = state.get("quality_attribute") or _guess_quality_attribute(asr_text)
+
+    # 3) Recuperamos fragmentos del “libro” (RAG local)
+    docs_list = []
+    try:
+        queries = [
+            f"{qa} architectural tactics",
+            f"{qa} tactics performance scalability latency availability security modifiability",
+            "Bass Clements Kazman performance and scalability tactics",
+            "quality attribute tactics list"
+        ]
+        seen = set()
+        for q in queries:
+            for d in retriever.invoke(q):
+                # evita duplicados por ruta+página
+                key = (d.metadata.get("source_path"), d.metadata.get("page"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                docs_list.append(d)
+                if len(docs_list) >= 6:
+                    break
+            if len(docs_list) >= 6:
+                break
+    except Exception:
+        docs_list = []
+
+    book_snippets = _dedupe_snippets(docs_list, max_items=5, max_chars=600)
+
+    # 4) Prompt: pedimos Markdown + JSON
+    prompt = f"""{directive}
+You are an expert software architect. Propose 6–10 **architectural tactics** to satisfy the following ASR.
+
+ASR:
+{asr_text or "(none provided)"}
+
+QUALITY ATTRIBUTE (guessed): {qa}
+
+GROUNDING (book snippets; keep names canonical, no vendor lock-in):
+{book_snippets or "(none)"}
+
+OUTPUT STRICTLY in TWO parts:
+(1) TACTICS (Markdown list). For each item:
+- Name — one line canonical name (e.g., "Introduce Caching", "Asynchronous Messaging", "Bulkhead", "Circuit Breaker", "Rate Limiting", "Elastic Horizontal Scaling", "Shard by Hash", "Edge Caching", "Backpressure").
+- Rationale — why it helps THIS ASR.
+- Consequences/Trade-offs — key costs/risks.
+- When to use — short condition.
+
+(2) JSON (in a single ```json code fence) with an array of objects [{{
+  "name": str,
+  "purpose": str,
+  "rationale": str,
+  "risks": [str],
+  "tradeoffs": [str],
+  "categories": [ "performance" | "latency" | "scalability" | "availability" | "security" | "modifiability" ],
+  "traces_to_asr": str,
+  "expected_effect": str
+}}].
+Keep everything concise and consistent with the ASR."""
+    resp = llm.invoke(prompt)
+    raw = getattr(resp, "content", str(resp)).strip()
+
+    # 5) Parseamos JSON y preparamos salidas
+    struct = _extract_first_json_block(raw) or []
+    md_only = _strip_code_block_json(raw)
+
+    # 6) Fuentes
+    src_lines = []
+    for d in (docs_list or []):
+        md = d.metadata or {}
+        title = md.get("source_title") or md.get("title") or "doc"
+        page  = md.get("page_label") or md.get("page")
+        path  = md.get("source_path") or md.get("source") or ""
+        page_str = f" (p.{page})" if page is not None else ""
+        src_lines.append(f"- {title}{page_str} — {path}")
+    if src_lines:
+        # corta y de-duplica
+        src_lines = list(dict.fromkeys([_clip_text(s, 60) for s in src_lines]))[:6]
+    src_block = "SOURCES:\n" + ("\n".join(src_lines) if src_lines else "- (no local sources)")
+
+    # 7) Traza y memoria
+    _push_turn(state, role="system", name="tactics_system", content=prompt)
+    _push_turn(state, role="assistant", name="tactics_advisor", content=md_only)
+    _push_turn(state, role="assistant", name="tactics_sources", content=src_block)
+
+    msgs = [
+        AIMessage(content=md_only, name="tactics_advisor"),
+        AIMessage(content=src_block, name="tactics_sources")
+    ]
+
+    # 8) Persistimos en el estado
+    state["tactics_md"] = md_only
+    state["tactics_struct"] = struct if isinstance(struct, list) else []
+    state["tactics_list"] = [ (it.get("name") or "").strip() for it in (struct or []) if isinstance(it, dict) and it.get("name") ]
+
+    # Señales para cortar en unifier
+    state["endMessage"] = md_only
+    state["intent"] = "tactics"
+    state["nextNode"] = "unifier"
+
+    return {**state, "messages": state["messages"] + msgs}
+
 
 def researcher_node(state: GraphState) -> GraphState:
     lang = state.get("language", "es")
     intent = state.get("intent", "general")
-    force_rag = state.get("force_rag", False)
+    force_rag = bool(state.get("force_rag", False))
+
+    # ⛔ GUARD 1: si estamos en turno ASR y NO se forzó RAG, no investigues
+    if intent == "asr" and not force_rag:
+        note = "(RAG omitido en turno ASR)" if lang == "es" else "(RAG skipped for ASR turn)"
+        _push_turn(state, role="assistant", name="researcher", content=note)
+        return {
+            **state,
+            "messages": state["messages"] + [AIMessage(content=note, name="researcher")],
+            "hasVisitedInvestigator": True
+        }
+
+    # ⛔ GUARD 2: si el intent real es diagrama, este nodo no debe hacer nada
+    if intent == "diagram":
+        note = "Generando el diagrama con el agente de diagramas…" if lang == "es" else "Diagram will be generated by the diagram agent…"
+        _push_turn(state, role="assistant", name="researcher", content=note)
+        return {
+            **state,
+            "messages": state["messages"] + [AIMessage(content=note, name="researcher")],
+            "hasVisitedInvestigator": True
+        }
 
     # saludo sin RAG
     if intent in ("greeting", "smalltalk"):
         quick = "Hola, ¿en qué tema de arquitectura te gustaría profundizar?" if lang == "es" \
                 else "Hi! How can I help you with software architecture today?"
         _push_turn(state, role="assistant", name="researcher", content=quick)
-        return {**state, "messages": state["messages"] + [AIMessage(content=quick, name="researcher")],
-                "hasVisitedInvestigator": True}
+        return {
+            **state,
+            "messages": state["messages"] + [AIMessage(content=quick, name="researcher")],
+            "hasVisitedInvestigator": True
+        }
 
+    # ---- Agente de investigación (con RAG opcional) ----
     sys = (
         "You are an expert in software architecture (ADD, quality attributes, tactics, views).\n"
         f"Always reply in {('Spanish' if lang=='es' else 'English')}.\n"
-        "- If the question is about architecture or ASRs, you MUST call `local_RAG` first "
-        "to ground your answer, then optionally complement with LLM or LLMWithImages."
+        "- If the question is about architecture, you SHOULD call `local_RAG` first to ground your answer,\n"
+        "  unless force_rag is False."
     )
     system_message = SystemMessage(content=sys)
     _push_turn(state, role="system", name="researcher_system", content=sys)
@@ -863,13 +1098,12 @@ def researcher_node(state: GraphState) -> GraphState:
         tools.append(LLMWithImages)
     agent = create_react_agent(llm, tools=tools)
 
-    # HINT corto
+    # HINT corto (ya NO forzamos RAG en ASR)
     hint_lines = []
-    if force_rag or intent in ("architecture", "asr"):
+    if force_rag or intent in ("architecture",):
         hint_lines.append("Start by calling the tool `local_RAG` with the user's question.")
     if intent == "architecture" and state.get("mermaidCode"):
         hint_lines.append("Also explain the tactics in the provided Mermaid, if any.")
-
     hint = _clip_text("\n".join(hint_lines).strip(), 100) if hint_lines else ""
 
     short_history = _last_k_messages(state["messages"], k=6)
@@ -883,20 +1117,23 @@ def researcher_node(state: GraphState) -> GraphState:
     }
 
     try:
-        result = agent.invoke(payload)
+        # Limita la recursión para evitar planeos largos del agente
+        result = agent.invoke(payload, config={"recursion_limit": 12})
     except Exception:
         messages_with_system = [system_message] + _last_k_messages(state["messages"], k=3)
         payload["messages"] = messages_with_system
-        result = agent.invoke(payload)
+        result = agent.invoke(payload, config={"recursion_limit": 8})
 
-    for msg in result["messages"]:
-        _push_turn(state, role="assistant", name="researcher", content=str(getattr(msg, "content", msg)))
+    msgs_out = result.get("messages", [])
+    for m in msgs_out:
+        _push_turn(state, role="assistant", name="researcher", content=str(getattr(m, "content", m)))
 
     return {
         **state,
-        "messages": state["messages"] + [AIMessage(content=msg.content, name="researcher") for msg in result["messages"]],
+        "messages": state["messages"] + [AIMessage(content=getattr(m, "content", str(m)), name="researcher") for m in msgs_out],
         "hasVisitedInvestigator": True
     }
+
 
 def creator_node(state: GraphState) -> GraphState:
     user_q = state["userQuestion"]
@@ -1122,10 +1359,34 @@ Next:
 - """ + "\n- ".join(tips)
         state["suggestions"] = tips
         return {**state, "endMessage": end_text, "intent": "diagram"}
+    
+        # Caso especial: TÁCTICAS
+    if intent == "tactics":
+        tactics_md = state.get("tactics_md") or _last_ai_by(state, "tactics_advisor") or "No tactics content."
+        src_txt = _last_ai_by(state, "tactics_sources")
+        refs_block = _extract_rag_sources_from(src_txt) if src_txt else "None"
+
+        followups = [
+            "¿Genero un diagrama de componentes aplicando estas tácticas?" if lang=="es" else "Generate a component diagram applying these tactics?",
+            "¿Convertimos estas tácticas en criterios de pruebas no funcionales?" if lang=="es" else "Turn these tactics into non-functional test criteria?",
+            "¿Quieres una estimación de riesgos/costos por táctica?" if lang=="es" else "Estimate risks/costs per tactic?",
+            "¿Mapeamos táctica → componente/servicio concreto?" if lang=="es" else "Map tactic → concrete component/service?"
+        ]
+        end_text = f"{tactics_md}\n\nReferences:\n{refs_block}\n\nNext:\n- " + "\n- ".join(followups)
+
+        state["suggestions"] = followups
+        state["turn_messages"] = state.get("turn_messages", []) + [
+            {"role": "assistant", "name": "unifier", "content": end_text}
+        ]
+        return {**state, "endMessage": end_text}
+
 
     # 1) Caso especial: ASR
     if intent == "asr":
-        last_asr = _last_ai_by(state, "asr_recommender") or "No ASR content found for this turn."
+        raw_asr = _last_ai_by(state, "asr_recommender") or "No ASR content found for this turn."
+        #si el LLM coló tácticas, las quitamos del ASR
+        last_asr = _strip_tactics_sections(raw_asr)
+
         asr_src_txt = _last_ai_by(state, "asr_sources")
         refs_block = _extract_rag_sources_from(asr_src_txt) if asr_src_txt else "None"
 
@@ -1147,6 +1408,7 @@ Next:
         ]
         state["suggestions"] = followups
         return {**state, "endMessage": end_text}
+
 
     # 2) Caso especial: saludo / smalltalk
     if intent in ("greeting", "smalltalk"):
@@ -1230,7 +1492,7 @@ SOURCE:
 
 class ClassifyOut(TypedDict):
     language: Literal["en","es"]
-    intent: Literal["greeting","smalltalk","architecture","diagram","asr","other"]
+    intent: Literal["greeting","smalltalk","architecture","diagram","asr","tactics","other"]
     use_rag: bool
 
 def classifier_node(state: GraphState) -> GraphState:
@@ -1238,7 +1500,7 @@ def classifier_node(state: GraphState) -> GraphState:
     prompt = f"""
 Classify the user's last message. Return JSON with:
 - language: "en" or "es"
-- intent: one of ["greeting","smalltalk","architecture","diagram","asr","other"]
+- intent: one of ["greeting","smalltalk","architecture","diagram","asr","tactics","other"]
 - use_rag: true if this is a software-architecture question (ADD, tactics, latency, scalability,
   quality attributes, views, styles, diagrams, ASR), else false.
 
@@ -1249,6 +1511,14 @@ User message:
 
     low = msg.lower()
     intent = out["intent"]
+    tactics_triggers = [
+        "tactic", "táctica", "tactica", "tácticas", "tactics", "tactcias",
+        "strategy","estrategia",
+        "cómo cumplir","como cumplir","how to meet","how to satisfy","how to achieve"
+    ]
+    if any(k in low for k in tactics_triggers):
+        intent = "tactics"
+    
     diagram_triggers = [
         "component diagram", "diagram", "diagrama", "diagrama de componentes",
         "uml", "plantuml", "c4", "bpmn",
@@ -1260,7 +1530,7 @@ User message:
     return {
         **state,
         "language": out["language"],
-        "intent": intent if intent in ["greeting","smalltalk","architecture","diagram","asr"] else "general",
+        "intent": intent if intent in ["greeting","smalltalk","architecture","diagram","asr","tactics"] else "general",
         "force_rag": bool(out["use_rag"]),
     }
 
@@ -1289,6 +1559,8 @@ builder.add_node("diagram_agent", diagram_orchestrator_node)  # Orquestador
 builder.add_node("evaluator", evaluator_node)
 builder.add_node("unifier", unifier_node)
 builder.add_node("asr", asr_node)
+builder.add_node("tactics", tactics_node)
+
 
 builder.add_node("boot", boot_node)
 builder.add_edge(START, "boot")
@@ -1299,7 +1571,8 @@ builder.add_edge("investigator", "supervisor")
 builder.add_edge("creator", "supervisor")
 builder.add_edge("diagram_agent", "supervisor")
 builder.add_edge("evaluator", "supervisor")
-builder.add_edge("asr", "supervisor")
+builder.add_edge("asr", "unifier")
+builder.add_edge("tactics", "unifier")
 builder.add_edge("unifier", END)
 
 graph = builder.compile(checkpointer=sqlite_saver)
