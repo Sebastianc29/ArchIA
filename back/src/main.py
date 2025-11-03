@@ -276,8 +276,8 @@ async def message(
     # ID incremental para feedback por mensaje
     message_id = get_next_message_id(session_id)
 
-    # Hilo único por turno (si quieres memoria full por sesión, usa thread_id = session_id)
-    thread_id = f"{session_id}:{message_id}"
+    # 🔁 IMPORTANTE: Usar un thread_id POR SESION, no por mensaje
+    thread_id = session_id
 
     # --- Manejo de imágenes (opcionales) ---
     image_path1 = ""
@@ -301,11 +301,17 @@ async def message(
     if image_path2:
         turn_messages.append(HumanMessage(content=f"[image_path_2] {image_path2}"))
 
-    # --- Memoria previa ---
+    # --- Memoria previa (MEJORADA) ---
     last_topic = memory_get(user_id, "topic", "")
-    asr_prev   = memory_get(user_id, "current_asr", "")
-    asr_notes  = memory_get(user_id, "asr_notes", "")
-    memory_text = f"Tema previo: {last_topic}. ASR previas: {asr_notes}".strip() or "N/A"
+
+    memory_text = (
+        f"Stage: {arch_flow.get('stage','')}\n"
+        f"Quality Attribute: {arch_flow.get('quality_attribute','')}\n"
+        f"Business / Context: {arch_flow.get('add_context','')}\n"
+        f"Current ASR:\n{arch_flow.get('current_asr','')}\n\n"
+        f"Tactics so far: {arch_flow.get('tactics', [])}\n"
+        f"User last topic: {last_topic}"
+    ).strip() or "N/A"
 
     # --- ASR pegado por el usuario (si lo hay) ---
     asr_in_msg = _extract_asr_from_message(message)
@@ -314,7 +320,8 @@ async def message(
     made_asr = _looks_like_make_asr(message)
 
     # --- Config del grafo ---
-    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 50}
+    # aquí ya estamos usando el mismo thread_id siempre para mantener memoria tipo ChatGPT
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 20}
     user_lang = detect_lang(message)
 
     # --- Heurísticas locales ---
@@ -330,7 +337,6 @@ async def message(
 
     user_intent = "general"
     if not arch_flow.get("current_asr"):
-        # No hay ASR en memoria -> el primer turno DEBE ser ASR
         user_intent = "asr"
     elif _wants_tactics(message):
         user_intent = "tactics"
@@ -340,9 +346,7 @@ async def message(
     if user_intent == "asr":
         force_rag = False
 
-    # Config del grafo (baja el límite mientras pruebas)
-    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 20}
-    # --- Limpieza parcial del estado (sin borrar historial) ---
+    # --- Limpieza parcial del estado (sin borrar historial persistente del grafo) ---
     try:
         graph.update_state(config, {"values": {
             "endMessage": "",
@@ -353,7 +357,7 @@ async def message(
             "current_asr": memory_get(user_id, "current_asr", ""),
         }})
     except Exception:
-        pass  # no crítico
+        pass
 
     # --- Invocación del grafo ---
     try:
@@ -373,7 +377,7 @@ async def message(
                 "mermaidCode": "",
                 "turn_messages": [],
                 "retrieved_docs": [],
-                "memory_text": memory_text,
+                "memory_text": memory_text,  # 👈 ahora es memoria rica
                 "suggestions": [],
                 "language": user_lang,
                 "intent": user_intent,

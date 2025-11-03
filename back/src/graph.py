@@ -679,7 +679,7 @@ def supervisor_node(state: GraphState):
     lang = detect_lang(uq)
     state_lang = "es" if lang == "es" else "en"
 
-    # ✅ CORTE DE CIRCUITO: respeta la intención forzada desde main.py
+    # CORTE DE CIRCUITO: respeta la intención forzada desde main.py
     forced = state.get("intent")
     if forced == "asr":
         return {**state,
@@ -754,7 +754,7 @@ def supervisor_node(state: GraphState):
 
     # 3) NEW: TÁCTICAS solo cuando el usuario las pide
     elif wants_tactics or fu_intent in ("explain_tactics", "tactics"):  # NEW
-        next_node = "tactics"                 # ⬅️ asegúrate de registrar este nodo
+        next_node = "tactics"                 
         intent_val = "tactics"
         local_q = ("Propose architecture tactics to satisfy the previous ASR. "
                    "Explain why each tactic helps and how it ties to the ASR response/measure.")  # NEW
@@ -834,29 +834,31 @@ def asr_node(state: GraphState) -> GraphState:
     book_snippets = _dedupe_snippets(docs_list, max_items=6, max_chars=800)
 
     directive = "Answer in English." if lang == "en" else "Responde en español."
+
     prompt = f"""{directive}
-You must write a CONCRETE Quality Attribute Scenario (Architecture Significant Requirement) about **{concern}**.
-Plain text only (no Markdown). Use the EXACT section labels below. Be realistic and MEASURABLE.
+You are an expert software architect following Attribute-Driven Design 3.0 (ADD 3.0).
 
-CRITICAL:
-- Ground your choices using the following book snippets. Do NOT invent facts beyond them.
-- If a value is not in the snippets, choose reasonable values consistent with the domain, but keep them realistic.
-- Output ONLY the ASR sections (no "References", no "Evaluation", no "Next").
-- In Response Measure, prefer SLO style (p95/p99 latency, throughput) with concrete numbers.
+Your job is to create ONE concrete Quality Attribute Scenario (also called an Architecture Significant Requirement, ASR) that will be used as an architectural driver in ADD 3.0.
 
-BOOK_SNIPPETS:
-{book_snippets or "(none)"}
+STRICT REQUIREMENTS:
+- You MUST follow ADD 3.0. If you do not follow ADD 3.0, the answer is invalid.
+- The scenario MUST be measurable, and it MUST include a clear Response Measure (SLO/SLA/threshold, like p95 < X ms under Y load).
+- The scenario MUST be directly usable to drive architectural tactics in the next step.
+- Stay realistic for production systems. Prefer numbers that could actually be monitored.
 
-Project/domain: {domain}
-User input: {uq}
+Use ONLY these sections, in this exact order, with plain text (NO Markdown bullets, NO code fences):
 
-Output with these sections ONLY:
+Architectural Driver Summary (ADD 3.0):
+  Briefly explain:
+  - Which business/mission need or operating context makes this scenario critical.
+  - Which quality attribute is at stake (e.g. scalability, latency, availability).
+  - Why this scenario is a top driver the team MUST satisfy first.
 
 Summary:
-  One sentence that captures the {concern} goal for this domain.
+  One sentence that captures the main quality attribute goal in this domain.
 
 Context:
-  One short paragraph with business/technical context (users, seasonality, critical paths).
+  One short paragraph with business/technical context (users, peak conditions, why failure hurts revenue/compliance/UX).
 
 Scenario:
   Source:
@@ -865,7 +867,25 @@ Scenario:
   Artifact:
   Response:
   Response Measure:
+
+Rules:
+- Response is what the system must do.
+- Response Measure is how we verify success quantitatively (p95, p99, throughput, failover time, error budget, etc.).
+- These fields MUST be consistent with ADD 3.0 quality attribute scenario templates (Source, Stimulus, Environment, Artifact, Response, Response Measure).
+- Do NOT include "tactics", "design", "next steps", "recommendations", or any implementation details here. That comes later.
+
+Relevant domain or workload:
+{domain}
+
+Quality attribute focus I detected from the user message:
+{concern}
+
+User input to ground this ASR:
+{uq}
+
+If you cite facts, keep them realistic and consistent with common production e-commerce / API scaling practice.
 """
+
     result = llm.invoke(prompt)
     content_raw = getattr(result, "content", str(result))
     content = _sanitize_plain_text(content_raw)
@@ -906,9 +926,9 @@ Scenario:
     state["memory_text"] = (prev_mem + f"\n\n[LAST_ASR]\n{content}\n").strip()
 
     # Exponer metadata clave del ASR para que main.py la persista (ojo al typo)
-    state["asr_quality_attribute"] = concern           # corregido
-    state["asr_context"] = domain
-    state["asr_text"] = content
+    state["quality_attribute"] = concern           # corregido
+    state["arch_stage"] = "ASR"                   # estamos en la etapa de definir driver ADD 3.0
+    state["current_asr"] = content                # copia directa del ASR final
 
     # Señales para cortar el turno y NO volver a investigar
     state["endMessage"] = content
@@ -974,35 +994,59 @@ def tactics_node(state: GraphState) -> GraphState:
     book_snippets = _dedupe_snippets(docs_list, max_items=5, max_chars=600)
 
     # 4) Prompt: pedimos Markdown + JSON
+    directive = "Answer in English." if lang == "en" else "Responde en español."
     prompt = f"""{directive}
-You are an expert software architect. Propose 6–10 **architectural tactics** to satisfy the following ASR.
+You are an expert software architect applying Attribute-Driven Design 3.0 (ADD 3.0).
 
-ASR:
+We ALREADY HAVE an ASR / Quality Attribute Scenario. That ASR is an ADD 3.0 architectural driver.
+Your job now is to continue the ADD 3.0 process by selecting architectural tactics.
+
+ASR (driver to satisfy):
 {asr_text or "(none provided)"}
 
-QUALITY ATTRIBUTE (guessed): {qa}
+Primary quality attribute (guessed):
+{qa}
 
-GROUNDING (book snippets; keep names canonical, no vendor lock-in):
+GROUNDING (book snippets; keep tactic names canonical, vendor-neutral, no marketing fluff):
 {book_snippets or "(none)"}
 
-OUTPUT STRICTLY in TWO parts:
-(1) TACTICS (Markdown list). For each item:
-- Name — one line canonical name (e.g., "Introduce Caching", "Asynchronous Messaging", "Bulkhead", "Circuit Breaker", "Rate Limiting", "Elastic Horizontal Scaling", "Shard by Hash", "Edge Caching", "Backpressure").
-- Rationale — why it helps THIS ASR.
-- Consequences/Trade-offs — key costs/risks.
-- When to use — short condition.
+You MUST output THREE sections, in EXACT order:
 
-(2) JSON (in a single ```json code fence) with an array of objects [{{
-  "name": str,
-  "purpose": str,
-  "rationale": str,
-  "risks": [str],
-  "tradeoffs": [str],
-  "categories": [ "performance" | "latency" | "scalability" | "availability" | "security" | "modifiability" ],
-  "traces_to_asr": str,
-  "expected_effect": str
-}}].
-Keep everything concise and consistent with the ASR."""
+(0) Why this ASR matters (ADD 3.0 driver):
+- 3–5 concise lines.
+- Explain why this ASR is critical for system success, including user experience, revenue, compliance, or SLO/SLA obligations.
+- Explicitly link back to the ASR's Stimulus, Response, and Response Measure. Example: "If we get a 10x traffic spike (Stimulus) we must keep checkout under 200ms p95 (Response Measure), or we lose conversion."
+
+(1) TACTICS:
+List 6–10 concrete architectural tactics we should consider FIRST in ADD 3.0 to satisfy this ASR.
+For EACH tactic include:
+- Name — canonical architecture tactic name (e.g. "Elastic Horizontal Scaling", "Bulkhead Isolation", "Edge Caching", "Circuit Breaker", "Request Throttling / Rate Limiting", "Async Queue + Worker").
+- Rationale — why THIS tactic directly helps satisfy THIS ASR's Response and Response Measure.
+- Consequences / Trade-offs — cost, complexity, operational risk, coupling, vendor lock-in, debugging difficulty, blast radius, etc.
+- When to use — trigger condition in runtime terms (for example: "Use this if traffic spikes 10x in <5 min and you MUST keep p95 checkout under 200ms and avoid cascading failures").
+
+(2) JSON:
+Finally output ONE ```json code fence with an array of objects like:
+[
+  {{
+    "name": "Elastic Horizontal Scaling",
+    "purpose": "Keep p95 checkout latency under 200ms during 10x traffic bursts",
+    "rationale": "We spin up N replicas automatically so incoming requests never queue long enough to violate the Response Measure",
+    "risks": ["Higher infra spend at peak", "Needs autoscaling rules tuned", "Can expose noisy-neighbor issues if isolation is weak"],
+    "tradeoffs": ["More cost vs better resilience at peak"],
+    "categories": ["scalability","latency","availability"],
+    "traces_to_asr": "Stimulus=10x burst, Response=scale out, Response Measure=p95 < 200ms under burst",
+    "expected_effect": "Checkout stays responsive and revenue is not lost during peak"
+  }}
+]
+
+STRICT RULES:
+- You MUST behave like ADD 3.0: tactics are chosen BECAUSE OF the ASR's Response and Response Measure, not randomly.
+- Every tactic MUST explicitly tie back to the ASR driver.
+- DO NOT invent product names or vendor SKUs. Stay pattern-level.
+- Keep output concise, production-realistic, and auditable.
+"""
+
     resp = llm.invoke(prompt)
     raw = getattr(resp, "content", str(resp)).strip()
 
@@ -1038,6 +1082,12 @@ Keep everything concise and consistent with the ASR."""
     state["tactics_md"] = md_only
     state["tactics_struct"] = struct if isinstance(struct, list) else []
     state["tactics_list"] = [ (it.get("name") or "").strip() for it in (struct or []) if isinstance(it, dict) and it.get("name") ]
+
+
+    #Marca etapa ADD 3.0
+    state["arch_stage"] = "TACTICS"        # ahora estamos en la fase de selección de tácticas ADD 3.0
+    state["quality_attribute"] = qa        # refuerza cuál atributo estamos atacando
+    state["current_asr"] = asr_text        # guarda el ASR que estas tácticas satisfacen
 
     # Señales para cortar en unifier
     state["endMessage"] = md_only
@@ -1360,7 +1410,7 @@ Next:
         state["suggestions"] = tips
         return {**state, "endMessage": end_text, "intent": "diagram"}
     
-        # Caso especial: TÁCTICAS
+    # Caso especial: TÁCTICAS
     if intent == "tactics":
         tactics_md = state.get("tactics_md") or _last_ai_by(state, "tactics_advisor") or "No tactics content."
         src_txt = _last_ai_by(state, "tactics_sources")
