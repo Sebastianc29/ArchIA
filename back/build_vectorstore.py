@@ -5,7 +5,8 @@ import os
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-from langchain_openai import OpenAIEmbeddings
+from dotenv import load_dotenv, find_dotenv
+from src.rag_agent import _embeddings as _embeddings_factory
 try:
     from langchain_chroma import Chroma
 except Exception:  # pragma: no cover
@@ -15,7 +16,7 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # ================== Paths / Config ==================
-
+load_dotenv(find_dotenv())
 BASE_DIR = Path(__file__).resolve().parent
 DOCS_DIR = BASE_DIR / "docs"
 PERSIST_DIR = Path(os.environ.get("CHROMA_DIR", str(BASE_DIR / "chroma_db")))
@@ -111,7 +112,7 @@ def main():
     print(f"[build] Total chunks: {len(chunks)}")
 
     # Embeddings y vectorstore
-    emb = OpenAIEmbeddings(model=EMBED_MODEL)
+    emb = _embeddings_factory()  # usa Azure/OpenAI según .env
     vectordb = Chroma.from_documents(
         documents=chunks,
         embedding=emb,

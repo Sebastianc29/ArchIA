@@ -14,7 +14,7 @@ from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 
 # LangChain / LangGraph
-from langchain_openai import ChatOpenAI
+from src.services.llm_factory import get_chat_model
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, AnyMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
@@ -85,7 +85,7 @@ conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
 sqlite_saver = SqliteSaver(conn)
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
-llm = ChatOpenAI(model=OPENAI_MODEL, temperature=0)
+llm = get_chat_model(temperature=0.0)  # autodetecta por .env
 retriever = get_retriever()
 
 # ========== Diagrams backend endpoints / modos

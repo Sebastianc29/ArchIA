@@ -28,7 +28,28 @@ _VDB: Chroma | None = None
 
 
 def _embeddings():
-    return OpenAIEmbeddings(model=EMBED_MODEL)
+    """Selecciona embeddings según proveedor (Azure/OpenAI)."""
+    import os
+    # Azure
+    if os.getenv("AZURE_OPENAI_API_KEY") and os.getenv("AZURE_OPENAI_ENDPOINT"):
+        from langchain_openai import AzureOpenAIEmbeddings
+        dep = (
+            os.getenv("AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT")
+            or os.getenv("AZURE_OPENAI_EMBED_DEPLOYMENT")
+            or os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
+        )
+        if not dep:
+            raise ValueError("Usando Azure: define AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT (deployment de embeddings).")
+        return AzureOpenAIEmbeddings(
+            azure_deployment=dep,
+            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+            openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview"),
+        )
+    # OpenAI (pública/compatibles)
+    from langchain_openai import OpenAIEmbeddings
+    model = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+    return OpenAIEmbeddings(model=model)
 
 
 def create_or_load_vectorstore() -> Chroma:
