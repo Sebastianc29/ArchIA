@@ -1,3 +1,5 @@
+# src/main.py
+
 from typing import Optional
 from pathlib import Path
 import os, re, sqlite3, base64
@@ -18,7 +20,8 @@ from src.memory import (
     load_arch_flow,
     save_arch_flow,
 )
-from src.clients.kroki_client import render_kroki_sync  # <- para el fallback
+from src.services.doc_ingest import extract_pdf_text
+from src.clients.kroki_client import render_kroki_sync
 
 memory_init()
 
@@ -48,6 +51,8 @@ app = FastAPI(title="ArquIA API", lifespan=lifespan)
 BACK_DIR = Path(__file__).resolve().parent.parent  # .../back/
 IMAGES_DIR = BACK_DIR / "images"
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+DOCS_DIR = BACK_DIR / "docs_uploads"
+DOCS_DIR.mkdir(parents=True, exist_ok=True)
 
 FEEDBACK_DIR = BACK_DIR / "feedback_db"
 FEEDBACK_DIR.mkdir(parents=True, exist_ok=True)
@@ -276,23 +281,46 @@ async def message(
     # ID incremental para feedback por mensaje
     message_id = get_next_message_id(session_id)
 
-    # 🔁 IMPORTANTE: Usar un thread_id POR SESION, no por mensaje
+    # Usar un thread_id POR SESION, no por mensaje
     thread_id = session_id
 
-    # --- Manejo de imágenes (opcionales) ---
-    image_path1 = ""
-    if image1 and image1.filename:
-        dest1 = IMAGES_DIR / image1.filename
-        with open(dest1, "wb") as f:
-            f.write(await image1.read())
-        image_path1 = str(dest1)
+    # --- Adjuntos (imagen o PDF) ---
+    def _is_pdf(up):
+        return bool(up and up.filename and (
+            (up.content_type or "").lower().startswith("application/pdf")
+            or up.filename.lower().endswith(".pdf")
+        ))
 
-    image_path2 = ""
+    async def _save(up, dst_dir):
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", up.filename or "file")
+        p = dst_dir / f"{session_id}__{safe}"
+        with open(p, "wb") as f:
+            f.write(await up.read())
+        return p
+
+    image_path1, image_path2 = "", ""
+    doc_context, doc_only = "", False
+
+    # image1
+    if image1 and image1.filename:
+        if _is_pdf(image1):
+            p = await _save(image1, DOCS_DIR)
+            doc_context = extract_pdf_text(str(p), max_chars=8000) or ""
+            doc_only = bool(doc_context.strip())
+        else:
+            p = await _save(image1, IMAGES_DIR)
+            image_path1 = str(p)
+
+    # image2
     if image2 and image2.filename:
-        dest2 = IMAGES_DIR / image2.filename
-        with open(dest2, "wb") as f:
-            f.write(await image2.read())
-        image_path2 = str(dest2)
+        if _is_pdf(image2):
+            p = await _save(image2, DOCS_DIR)
+            extra = extract_pdf_text(str(p), max_chars=8000) or ""
+            doc_context = (doc_context + "\n\n" + extra).strip() if extra else doc_context
+            doc_only = bool(doc_context.strip())
+        else:
+            p = await _save(image2, IMAGES_DIR)
+            image_path2 = str(p)
 
     # --- Turno actual como HumanMessage(s) ---
     turn_messages = [HumanMessage(content=message)]
@@ -300,9 +328,23 @@ async def message(
         turn_messages.append(HumanMessage(content=f"[image_path_1] {image_path1}"))
     if image_path2:
         turn_messages.append(HumanMessage(content=f"[image_path_2] {image_path2}"))
+    if doc_only and doc_context:
+        # visible en el turno para trazabilidad
+        turn_messages.append(HumanMessage(content=f"[DOCUMENT_EXCERPT]\n{doc_context[:4000]}"))
 
     # --- Memoria previa (MEJORADA) ---
     last_topic = memory_get(user_id, "topic", "")
+
+    # ➜ FIX: antes se usaba uploaded_pdf_snippets (no existe). Usamos doc_context.
+    pdf_context_turn = doc_context  # FIX
+
+    if pdf_context_turn:
+        # Persistimos en arch_flow.add_context (append no destructivo)
+        af = dict(arch_flow)
+        prev_ctx = (af.get("add_context") or "").strip()
+        af["add_context"] = (prev_ctx + "\n\n" + pdf_context_turn).strip() if prev_ctx else pdf_context_turn
+        save_arch_flow(user_id, af)
+        arch_flow = af  # usarlo ya mismo
 
     memory_text = (
         f"Stage: {arch_flow.get('stage','')}\n"
@@ -320,7 +362,6 @@ async def message(
     made_asr = _looks_like_make_asr(message)
 
     # --- Config del grafo ---
-    # aquí ya estamos usando el mismo thread_id siempre para mantener memoria tipo ChatGPT
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 20}
     user_lang = detect_lang(message)
 
@@ -334,6 +375,9 @@ async def message(
             msg_low
         ))
     )
+
+    if doc_only:
+        force_rag = False  # DOC-ONLY desactiva RAG
 
     user_intent = "general"
     if not arch_flow.get("current_asr"):
@@ -351,7 +395,7 @@ async def message(
         graph.update_state(config, {"values": {
             "endMessage": "",
             "mermaidCode": "",
-            "diagram": None,
+            "diagram": {},  # FIX: dict vacío, no None
             "hasVisitedDiagram": False,
             "turn_messages": [],
             "current_asr": memory_get(user_id, "current_asr", ""),
@@ -373,16 +417,18 @@ async def message(
                 "nextNode": "supervisor",
                 "imagePath1": image_path1,
                 "imagePath2": image_path2,
+                "doc_only": doc_only,
+                "doc_context": doc_context,
                 "endMessage": "",
                 "mermaidCode": "",
                 "turn_messages": [],
                 "retrieved_docs": [],
-                "memory_text": memory_text,  # 👈 ahora es memoria rica
+                "memory_text": memory_text,  # memoria rica
                 "suggestions": [],
                 "language": user_lang,
                 "intent": user_intent,
                 "force_rag": force_rag,
-                "topic_hint": topic_hint,
+                "topic_hint": topic_hint,  # opcional; el grafo puede ignorarlo
                 "current_asr": memory_get(user_id, "current_asr", ""),
                 "arch_stage": arch_flow.get("stage", ""),
                 "quality_attribute": arch_flow.get("quality_attribute", ""),
@@ -418,33 +464,25 @@ async def message(
 
     # Actualizar arch_flow con el ASR generado/refinado
     if result.get("hasVisitedASR"):
-        # texto final del ASR que vamos a recordar siempre
         arch_flow["current_asr"] = memory_get(user_id, "current_asr", "")
-        # atributo de calidad detectado por asr_node (latency, availability, etc.)
         arch_flow["quality_attribute"] = result.get(
             "asr_quality_attribute",
             arch_flow.get("quality_attribute", "")
         )
-        # contexto / dominio del sistema (e-commerce, API pública...)
         arch_flow["add_context"] = result.get(
             "asr_context",
             arch_flow.get("add_context", "")
         )
-        # hemos alcanzado formalmente la etapa ASR
         arch_flow["stage"] = "ASR"
 
     # --- Persistir tácticas si este turno fue de tácticas ---
     tactics_json = result.get("tactics_struct") or None
     tactics_md   = result.get("tactics_md") or ""
-
     if user_intent == "tactics" and (tactics_json or tactics_md):
-        arch_flow["tactics"] = tactics_json or []   # guarda estructura si vino
+        arch_flow["tactics"] = tactics_json or []
         arch_flow["stage"] = "TACTICS"
-    
+
     # ===================== DIAGRAMA =====================
-    # Usa el diagrama que venga del agente. SOLO usa fallback si:
-    #   (1) el usuario pidió “diagram ... of that ASR”, o
-    #   (2) NO llegó ningún diagrama (missing).
     diagram_obj = result.get("diagram") or {}
     new_b64 = (diagram_obj.get("svg_b64") or "").strip()
     prev_b64 = memory_get(user_id, "last_svg_b64", "").strip()
@@ -484,24 +522,23 @@ async def message(
     if new_b64:
         memory_set(user_id, "last_svg_b64", new_b64)
 
-    #si ya obtuvimos un diagrama de despliegue, lo persistimos ----
+    # Persistimos diagrama de despliegue si llegó
     if diagram_obj and diagram_obj.get("svg_b64"):
-        # Guarda el diagrama renderizado
         arch_flow["deployment_diagram_puml"] = diagram_obj.get("source_echo", "")
         arch_flow["deployment_diagram_svg_b64"] = diagram_obj.get("svg_b64", "")
 
     # Solo marcamos DEPLOYMENT si el usuario pidió despliegue explícitamente
     if _wants_deployment(message):
         arch_flow["stage"] = "DEPLOYMENT"
-        
+
     # Persistimos el estado ADD 3.0 actualizado
     save_arch_flow(user_id, arch_flow)
-    
+
     # --- Payload al front (no pisamos suggestions si las necesitas) ---
     clean_payload = {
         "endMessage": end_msg,
         "mermaidCode": result.get("mermaidCode", ""),
-        "diagram": diagram_obj,                # <- usa diagram.data_uri o svg_b64 en el front
+        "diagram": diagram_obj,                # usa diagram.data_uri o svg_b64 en el front
         "messages": result.get("turn_messages", []),
         "session_id": session_id,
         "message_id": message_id,

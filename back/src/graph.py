@@ -245,6 +245,8 @@ class GraphState(TypedDict):
     hasVisitedEvaluator: bool
     hasVisitedASR: bool
     nextNode: Literal["investigator", "creator", "evaluator", "diagram_agent", "tactics", "asr", "unifier"]
+    doc_only: bool
+    doc_context: str
 
     imagePath1: str
     imagePath2: str
@@ -430,12 +432,14 @@ def makeSupervisorPrompt(state: GraphState) -> str:
     if state["hasVisitedEvaluator"]:    visited_nodes.append("evaluator")
     if state.get("hasVisitedASR", False): visited_nodes.append("asr")
     visited_nodes_str = ", ".join(visited_nodes) if visited_nodes else "none"
-
+    doc_flag = "ON" if state.get("doc_only") else "OFF"
     return f"""You are a supervisor orchestrating: investigator, creator (diagrams), evaluator, and ASR advisor.
 Choose the next worker and craft a specific sub-question.
 
 Rules:
-- If user asks about ADD/architecture, prefer investigator (and it must call local_RAG).
+- DOC-ONLY mode is {doc_flag}.
+- If DOC-ONLY is ON: DO NOT call or suggest any retrieval tool (no local_RAG). Answers MUST rely only on the PROJECT DOCUMENT context provided.
+- If DOC-ONLY is OFF and user asks about ADD/architecture, prefer investigator (and it may call local_RAG).
 - If user asks for a diagram, route to creator.
 - If user asks for an ASR or a QAS, route to asr.
 - If two images are provided, evaluator may compare/analyze.
@@ -754,7 +758,7 @@ def supervisor_node(state: GraphState):
 
     # 3) NEW: TÁCTICAS solo cuando el usuario las pide
     elif wants_tactics or fu_intent in ("explain_tactics", "tactics"):  # NEW
-        next_node = "tactics"                 
+        next_node = "tactics"
         intent_val = "tactics"
         local_q = ("Propose architecture tactics to satisfy the previous ASR. "
                    "Explain why each tactic helps and how it ties to the ASR response/measure.")  # NEW
@@ -805,6 +809,8 @@ def _dedupe_snippets(docs_list, max_items=3, max_chars=400) -> str:
 def asr_node(state: GraphState) -> GraphState:
     lang = state.get("language", "es")
     uq = state.get("userQuestion", "") or ""
+    doc_only = bool(state.get("doc_only"))
+    ctx_doc = (state.get("doc_context") or "").strip()
 
     # Heurística del atributo
     concern = "scalability" if re.search(r"scalab", uq, re.I) else \
@@ -823,7 +829,7 @@ def asr_node(state: GraphState) -> GraphState:
 
     # === RAG (saltable) ===
     docs_list = []
-    if state.get("force_rag", False):
+    if state.get("force_rag", False) and not doc_only:
         try:
             query = f"{concern} quality attribute scenario latency measure stimulus environment artifact response measure"
             docs_raw = list(retriever.invoke(query))
@@ -834,9 +840,14 @@ def asr_node(state: GraphState) -> GraphState:
     book_snippets = _dedupe_snippets(docs_list, max_items=6, max_chars=800)
 
     directive = "Answer in English." if lang == "en" else "Responde en español."
+    # En DOC-ONLY prioriza el documento; si no, add_context
+    ctx = (ctx_doc if (doc_only and ctx_doc) else (state.get("add_context") or "")).strip()[:2000]
 
     prompt = f"""{directive}
 You are an expert software architect following Attribute-Driven Design 3.0 (ADD 3.0).
+
+If DOC-ONLY mode is ON, you MUST base your answer ONLY on the PROJECT DOCUMENT below.
+If the document lacks necessary data, say so explicitly and ask for a more detailed document.
 
 Your job is to create ONE concrete Quality Attribute Scenario (also called an Architecture Significant Requirement, ASR) that will be used as an architectural driver in ADD 3.0.
 
@@ -882,6 +893,9 @@ Quality attribute focus I detected from the user message:
 
 User input to ground this ASR:
 {uq}
+
+PROJECT CONTEXT (if any):
+{ctx or "None"}
 
 If you cite facts, keep them realistic and consistent with common production e-commerce / API scaling practice.
 """
@@ -955,6 +969,10 @@ def _guess_quality_attribute(text: str) -> str:
 def tactics_node(state: GraphState) -> GraphState:
     lang = state.get("language", "es")
     directive = "Answer in English." if lang == "en" else "Responde en español."
+    doc_only = bool(state.get("doc_only"))
+    ctx_doc = (state.get("doc_context") or "").strip()
+    ctx_add = (state.get("add_context") or "").strip()
+    ctx = (ctx_doc if (doc_only and ctx_doc) else ctx_add)[:2000]
 
     # 1) Tomamos el ASR actual (o lo inferimos del mensaje)
     asr_text = state.get("asr_text") or state.get("last_asr") or ""
@@ -966,40 +984,45 @@ def tactics_node(state: GraphState) -> GraphState:
     # 2) Deducimos el atributo de calidad
     qa = state.get("quality_attribute") or _guess_quality_attribute(asr_text)
 
-    # 3) Recuperamos fragmentos del “libro” (RAG local)
+    # 3) Contexto para grounding: DOC-ONLY → sin RAG; otro caso → RAG normal
     docs_list = []
-    try:
-        queries = [
-            f"{qa} architectural tactics",
-            f"{qa} tactics performance scalability latency availability security modifiability",
-            "Bass Clements Kazman performance and scalability tactics",
-            "quality attribute tactics list"
-        ]
-        seen = set()
-        for q in queries:
-            for d in retriever.invoke(q):
-                # evita duplicados por ruta+página
-                key = (d.metadata.get("source_path"), d.metadata.get("page"))
-                if key in seen:
-                    continue
-                seen.add(key)
-                docs_list.append(d)
-                if len(docs_list) >= 6:
+    if doc_only and ctx_doc:
+        book_snippets = f"[DOC] {ctx_doc[:2000]}"
+    else:
+        try:
+            queries = [
+                f"{qa} architectural tactics",
+                f"{qa} tactics performance scalability latency availability security modifiability",
+                "Bass Clements Kazman performance and scalability tactics",
+                "quality attribute tactics list"
+            ]
+            seen = set()
+            gathered = []
+            for q in queries:
+                for d in retriever.invoke(q):
+                    key = (d.metadata.get("source_path"), d.metadata.get("page"))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    gathered.append(d)
+                    if len(gathered) >= 6:
+                        break
+                if len(gathered) >= 6:
                     break
-            if len(docs_list) >= 6:
-                break
-    except Exception:
-        docs_list = []
-
-    book_snippets = _dedupe_snippets(docs_list, max_items=5, max_chars=600)
+            docs_list = gathered
+        except Exception:
+            docs_list = []
+        book_snippets = _dedupe_snippets(docs_list, max_items=5, max_chars=600)
 
     # 4) Prompt: pedimos Markdown + JSON
-    directive = "Answer in English." if lang == "en" else "Responde en español."
     prompt = f"""{directive}
 You are an expert software architect applying Attribute-Driven Design 3.0 (ADD 3.0).
 
 We ALREADY HAVE an ASR / Quality Attribute Scenario. That ASR is an ADD 3.0 architectural driver.
 Your job now is to continue the ADD 3.0 process by selecting architectural tactics.
+
+PROJECT CONTEXT (if any)
+{ctx or "None"}
 
 ASR (driver to satisfy):
 {asr_text or "(none provided)"}
@@ -1007,8 +1030,11 @@ ASR (driver to satisfy):
 Primary quality attribute (guessed):
 {qa}
 
-GROUNDING (book snippets; keep tactic names canonical, vendor-neutral, no marketing fluff):
+
+GROUNDING (use ONLY this context; if DOC-ONLY, this is the exclusive source):
 {book_snippets or "(none)"}
+
+If DOC-ONLY is ON, do not rely on knowledge beyond the PROJECT DOCUMENT even if you “know” typical tactics. If the document does not support a tactic, state “not supported by the document”.
 
 You MUST output THREE sections, in EXACT order:
 
@@ -1101,6 +1127,8 @@ def researcher_node(state: GraphState) -> GraphState:
     lang = state.get("language", "es")
     intent = state.get("intent", "general")
     force_rag = bool(state.get("force_rag", False))
+    doc_only = bool(state.get("doc_only"))
+    ctx_doc = (state.get("doc_context") or "").strip()
 
     # ⛔ GUARD 1: si estamos en turno ASR y NO se forzó RAG, no investigues
     if intent == "asr" and not force_rag:
@@ -1133,31 +1161,42 @@ def researcher_node(state: GraphState) -> GraphState:
             "hasVisitedInvestigator": True
         }
 
-    # ---- Agente de investigación (con RAG opcional) ----
+    # ---- Agente de investigación (con RAG opcional / DOC-ONLY bloquea RAG) ----
     sys = (
         "You are an expert in software architecture (ADD, quality attributes, tactics, views).\n"
-        f"Always reply in {('Spanish' if lang=='es' else 'English')}.\n"
-        "- If the question is about architecture, you SHOULD call `local_RAG` first to ground your answer,\n"
-        "  unless force_rag is False."
+        f"Always reply in {('Spanish' if lang=='es' else 'English')}.\n" +
+        ("- If the question is about architecture, you SHOULD call `local_RAG` first to ground your answer, unless force_rag is False."
+         if not doc_only else
+         "- DOC-ONLY is ON: do NOT call retrieval. Base your answer ONLY on the PROJECT DOCUMENT.\n")
     )
+
     system_message = SystemMessage(content=sys)
     _push_turn(state, role="system", name="researcher_system", content=sys)
 
-    tools = [local_RAG, LLM]
-    if _HAS_VERTEX:
-        tools.append(LLMWithImages)
+    # Contexto: prioriza doc_context en DOC-ONLY, si no, usa add_context
+    ctx_add = (state.get("add_context") or "").strip()
+    ctx_for_prompt = ctx_doc if (doc_only and ctx_doc) else ctx_add
+    context_message = SystemMessage(
+        content=f"PROJECT DOCUMENT (exclusive source):\n{ctx_for_prompt}"
+    ) if (doc_only and ctx_for_prompt) else (
+        SystemMessage(content=f"PROJECT CONTEXT:\n{ctx_for_prompt}") if ctx_for_prompt else None
+    )
+
+    # Herramientas: sin RAG en DOC-ONLY
+    tools = ([LLM] + ([LLMWithImages] if _HAS_VERTEX else [])) if doc_only else ([local_RAG, LLM] + ([LLMWithImages] if _HAS_VERTEX else []))
     agent = create_react_agent(llm, tools=tools)
 
-    # HINT corto (ya NO forzamos RAG en ASR)
+    # HINT corto (solo si no estamos en DOC-ONLY)
     hint_lines = []
-    if force_rag or intent in ("architecture",):
+    if (force_rag or intent in ("architecture",)) and not doc_only:
         hint_lines.append("Start by calling the tool `local_RAG` with the user's question.")
     if intent == "architecture" and state.get("mermaidCode"):
         hint_lines.append("Also explain the tactics in the provided Mermaid, if any.")
     hint = _clip_text("\n".join(hint_lines).strip(), 100) if hint_lines else ""
 
     short_history = _last_k_messages(state["messages"], k=6)
-    messages_with_system = [system_message] + short_history
+    messages_with_system = [system_message] + ([context_message] if context_message else []) + short_history
+
     payload = {
         "messages": messages_with_system + ([HumanMessage(content=hint)] if hint else []),
         "userQuestion": state["userQuestion"],
@@ -1258,6 +1297,8 @@ def evaluator_node(state: GraphState) -> GraphState:
     lang = state.get("language", "es")
     uq = (state.get("userQuestion") or "")
     concern_hint = "latency" if re.search(r"latenc", uq, re.I) else ("scalability" if re.search(r"scalab", uq, re.I) else "")
+    doc_only = bool(state.get("doc_only"))
+    ctx_doc = (state.get("doc_context") or "").strip()
 
     # --- MODO 1: evaluación de ASR ---
     if _looks_like_eval(uq):
@@ -1268,7 +1309,10 @@ def evaluator_node(state: GraphState) -> GraphState:
             _push_turn(state, role="assistant", name="evaluator", content=short)
             return {**state, "messages": state["messages"] + [AIMessage(content=short, name="evaluator")], "hasVisitedEvaluator": True}
 
-        book_snips = _book_snippets_for_eval(retriever, concern_hint)
+        if doc_only and ctx_doc:
+            book_snips = f"[DOC] {ctx_doc[:1500]}"
+        else:
+            book_snips = _book_snippets_for_eval(retriever, concern_hint)
 
         directive = "Responde en español." if lang=="es" else "Answer in English."
         eval_prompt = f"""{directive}
@@ -1300,6 +1344,7 @@ Rewrite (improved ASR):
 References:
   List 2–5 short items only if grounded by BOOK_SNIPPETS; otherwise write "None".
 """
+        eval_prompt = ("DOC-ONLY mode: ON. Reason exclusively from the PROJECT DOCUMENT.\n\n" + eval_prompt) if doc_only else eval_prompt
         result = llm.invoke(eval_prompt)
         content = getattr(result, "content", str(result)).strip()
 
@@ -1319,6 +1364,11 @@ References:
     evaluator_agent = create_react_agent(llm, tools=tools)
 
     eval_prompt = getEvaluatorPrompt(state.get("imagePath1",""), state.get("imagePath2",""))
+    ctx_add = (state.get("add_context") or "").strip()[:1500]
+    if doc_only and ctx_doc:
+        eval_prompt = f"DOC-ONLY: use exclusively this PROJECT DOCUMENT.\n{ctx_doc[:1500]}\n\n" + eval_prompt
+    elif ctx_add:
+        eval_prompt = f"PROJECT CONTEXT:\n{ctx_add}\n\n" + eval_prompt
     _push_turn(state, role="system", name="evaluator_system", content=eval_prompt)
 
     messages_with_system = [SystemMessage(content=eval_prompt)] + state["messages"]
@@ -1341,7 +1391,7 @@ References:
 
 # --- Unifier ---
 
-def _last_ai_by(state, name: str) -> str:
+def _last_ai_by(state: GraphState, name: str) -> str:
     for m in reversed(state["messages"]):
         if isinstance(m, AIMessage) and getattr(m, "name", None) == name and m.content:
             return m.content

@@ -17,3 +17,5 @@ unstructured
 chromadb
 langgraph-checkpoint-postgres
 httpx
+pymupdf
+pypdf
