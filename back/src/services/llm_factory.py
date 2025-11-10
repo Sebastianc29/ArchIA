@@ -30,6 +30,8 @@ AZURE_ALIASES: Dict[str, Dict[str, str]] = {
     "o3mini":    {"model_hint": "o3-mini",     "env": "AZURE_OPENAI_DEPLOYMENT_O3_MINI"},
     "gpt41":     {"model_hint": "gpt-4.1",     "env": "AZURE_OPENAI_DEPLOYMENT_GPT41"},
     "gpt41mini": {"model_hint": "gpt-4.1-mini","env": "AZURE_OPENAI_DEPLOYMENT_GPT41_MINI"},
+    "gpt5":     {"model_hint": "gpt-5",      "env": "AZURE_OPENAI_DEPLOYMENT_GPT5"},
+    "gpt5mini": {"model_hint": "gpt-5-mini", "env": "AZURE_OPENAI_DEPLOYMENT_GPT5_MINI"},
 }
 
 OLLAMA_ALIASES: Dict[str, str] = {
@@ -122,7 +124,7 @@ def get_chat_model(
         from langchain_openai import ChatOpenAI
         base_url = _env("OPENAI_BASE_URL")
         key = _env("OPENAI_API_KEY", "dummy-key" if base_url else None)
-        mdl = model or _env("ROS_LG_LLM_MODEL") or _env("OPENAI_MODEL", "gpt-4o-mini")
+        mdl = model or _env("ROS_LG_LLM_MODEL") or _env("OPENAI_MODEL", "gpt-5-mini")
         if not (key or base_url):
             raise ValueError("OpenAI: faltan OPENAI_API_KEY o OPENAI_BASE_URL (para servidores compatibles).")
         return ChatOpenAI(

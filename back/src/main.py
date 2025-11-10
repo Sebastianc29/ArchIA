@@ -22,7 +22,8 @@ from src.memory import (
 )
 from src.services.doc_ingest import extract_pdf_text
 from src.clients.kroki_client import render_kroki_sync
-
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv())
 memory_init()
 
 # ===================== Detección simple de idioma (ES/EN) ==========================

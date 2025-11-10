@@ -84,7 +84,7 @@ DB_PATH = STATE_DIR / "example.db"
 conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
 sqlite_saver = SqliteSaver(conn)
 
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+OPENAI_MODEL = os.getenv("ROS_LG_LLM_MODEL") or os.getenv("OPENAI_MODEL", "gpt-5-mini")
 llm = get_chat_model(temperature=0.0)  # autodetecta por .env
 retriever = get_retriever()
 

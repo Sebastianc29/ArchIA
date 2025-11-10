@@ -24,6 +24,7 @@ pip install chromadb
 
 # Instala procesamiento de documentos
 pip install pypdf tiktoken
+pip install -U langchain-openai langchain-ollama python-dotenv
 
 # Instala embeddings (puedes elegir entre OpenAI o HuggingFace)
 pip install sentence-transformers
