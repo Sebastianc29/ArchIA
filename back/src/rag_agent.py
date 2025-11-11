@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from langchain_openai import OpenAIEmbeddings, AzureOpenAIEmbeddings
 
 # Usa el paquete nuevo si está instalado; si no, cae al community.
 try:
@@ -26,31 +27,38 @@ COLLECTION_NAME = "arquia"
 # Singleton del vectorstore
 _VDB: Chroma | None = None
 
-
 def _embeddings():
-    """Selecciona embeddings según proveedor (Azure/OpenAI)."""
-    import os
-    # Azure
-    if os.getenv("AZURE_OPENAI_API_KEY") and os.getenv("AZURE_OPENAI_ENDPOINT"):
-        from langchain_openai import AzureOpenAIEmbeddings
-        dep = (
-            os.getenv("AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT")
-            or os.getenv("AZURE_OPENAI_EMBED_DEPLOYMENT")
-            or os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
+    """Crea la función de embeddings según env. Usa Azure si hay vars AZURE_*."""
+    az_key = os.getenv("AZURE_OPENAI_API_KEY")
+    az_ep  = os.getenv("AZURE_OPENAI_ENDPOINT")
+    if az_key and az_ep:
+        # ---- Azure OpenAI ----
+        # Debes tener creado un deployment de embeddings en Azure y poner su nombre:
+        az_embed_deploy = (
+            os.getenv("AZURE_OPENAI_EMBED_DEPLOYMENT")
+            or os.getenv("AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT")
+            or os.getenv("AZURE_OPENAI_EMBED_MODEL")
         )
-        if not dep:
-            raise ValueError("Usando Azure: define AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT (deployment de embeddings).")
+        if not az_embed_deploy:
+            raise RuntimeError(
+                "Falta AZURE_OPENAI_EMBED_DEPLOYMENT en .env (deployment de embeddings en Azure)."
+            )
+        az_api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21")
         return AzureOpenAIEmbeddings(
-            azure_deployment=dep,
-            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-            openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview"),
+            azure_deployment=az_embed_deploy,
+            api_key=az_key,
+            azure_endpoint=az_ep,
+            api_version=az_api_version,
         )
-    # OpenAI (pública/compatibles)
-    from langchain_openai import OpenAIEmbeddings
-    model = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
-    return OpenAIEmbeddings(model=model)
-
+    else:
+        # ---- OpenAI clásico ----
+        # Requiere OPENAI_API_KEY y (opcional) OPENAI_BASE_URL si usas proxy
+        model = os.getenv("OPENAI_EMBEDDINGS_MODEL", "text-embedding-3-large")
+        return OpenAIEmbeddings(
+            model=model,
+            api_key=os.getenv("OPENAI_API_KEY"),
+            base_url=os.getenv("OPENAI_BASE_URL")  # opcional
+        )
 
 def create_or_load_vectorstore() -> Chroma:
     """
