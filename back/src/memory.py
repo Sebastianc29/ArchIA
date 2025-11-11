@@ -48,8 +48,6 @@ def empty_arch_flow() -> dict:
         "quality_attribute": "", # Eje: "availability", "latency"
         "add_context":"", #dominio / driver de negocio
         "current_asr":"", # ASR oficial
-        "style_options": [],
-        "selected_styles": [],
         "tactics": [], #Lista de tácticas aceptadas
         "deployment_diagram_puml":"", #PlantUML del despliegue final
         "deployment_diagram_svg_b64":"", #SVG base 64 del despliegue final

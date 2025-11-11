@@ -1,124 +1,156 @@
 # src/services/llm_factory.py
 from __future__ import annotations
-
+from typing import Optional, Literal, Any, Dict
 import os
-import logging
-from typing import Optional, Literal
-
 from langchain_core.language_models import BaseChatModel
-from langchain_openai import ChatOpenAI, AzureChatOpenAI
 
-# ChatOllama es opcional: solo si usas provider=ollama
-try:
-    from langchain_community.chat_models import ChatOllama  # type: ignore
-except Exception:  # pragma: no cover
-    ChatOllama = None  # type: ignore
+# --------------------------- utilidades ---------------------------
 
-log = logging.getLogger(__name__)
-
-
-# =============== Utilidades env =================
-def _env(name: str, default: Optional[str] = None) -> Optional[str]:
-    """Obtiene variable de entorno limpia (sin espacios)."""
-    v = os.getenv(name, default)
-    if v is not None and isinstance(v, str):
-        v = v.strip()
-    return v or default
-
-
-def _auto_provider() -> Literal["azure", "openai", "ollama"]:
-    """
-    Prioridad:
-      1) ROS_LG_LLM_PROVIDER (si está definida)
-      2) Si hay credenciales/config de Azure → 'azure'
-      3) Si hay OPENAI_API_KEY o OPENAI_BASE_URL → 'openai'
-      4) Si no, fallback → 'ollama'
-    """
-    forced = _env("ROS_LG_LLM_PROVIDER")
-    if forced:
-        return forced.lower()  # type: ignore
-
-    if _env("AZURE_OPENAI_API_KEY") and _env("AZURE_OPENAI_ENDPOINT"):
+def _auto_provider() -> str:
+    """Detecta proveedor automáticamente según variables de entorno."""
+    if os.getenv("ROS_LG_LLM_PROVIDER"):
+        return os.getenv("ROS_LG_LLM_PROVIDER").lower()
+    if os.getenv("AZURE_OPENAI_API_KEY") and os.getenv("AZURE_OPENAI_ENDPOINT"):
         return "azure"
-
-    if _env("OPENAI_API_KEY") or _env("OPENAI_BASE_URL"):
+    if os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_BASE_URL"):
         return "openai"
-
     return "ollama"
 
+def _env(name: str, default: Optional[str] = None) -> Optional[str]:
+    v = os.getenv(name)
+    return v if v not in (None, "", "None") else default
 
-# =============== Fábrica principal =================
-def get_chat_model(temperature: Optional[float] = 0.0) -> BaseChatModel:
+def _normalize_alias(s: str) -> str:
+    return "".join(ch for ch in s.lower() if ch.isalnum())
+
+# Mapas de alias -> variables esperadas en .env
+AZURE_ALIASES: Dict[str, Dict[str, str]] = {
+    "gpt4omini": {"model_hint": "gpt-4o-mini", "env": "AZURE_OPENAI_DEPLOYMENT_GPT4O_MINI"},
+    "gpt4o":     {"model_hint": "gpt-4o",      "env": "AZURE_OPENAI_DEPLOYMENT_GPT4O"},
+    "o3mini":    {"model_hint": "o3-mini",     "env": "AZURE_OPENAI_DEPLOYMENT_O3_MINI"},
+    "gpt41":     {"model_hint": "gpt-4.1",     "env": "AZURE_OPENAI_DEPLOYMENT_GPT41"},
+    "gpt41mini": {"model_hint": "gpt-4.1-mini","env": "AZURE_OPENAI_DEPLOYMENT_GPT41_MINI"},
+    "gpt5":     {"model_hint": "gpt-5",      "env": "AZURE_OPENAI_DEPLOYMENT_GPT5"},
+    "gpt5mini": {"model_hint": "gpt-5-mini", "env": "AZURE_OPENAI_DEPLOYMENT_GPT5_MINI"},
+}
+
+OLLAMA_ALIASES: Dict[str, str] = {
+    "llama3.2:3b": "llama3.2:3b",
+    "llama3.1:8b": "llama3.1:8b",
+    "mistral:7binstruct": "mistral:7b-instruct",
+    "qwen2.5:7binstruct": "qwen2.5:7b-instruct",
+    "deepseekr1:7b": "deepseek-r1:7b",
+    # alias “humanos”:
+    "llama33b": "llama3.2:3b",
+    "llama318b": "llama3.1:8b",
+    "mistral7b": "mistral:7b-instruct",
+    "qwen25_7b": "qwen2.5:7b-instruct",
+    "deepseekr1_7b": "deepseek-r1:7b",
+}
+
+def _resolve_azure_deployment(sel: Optional[str]) -> str:
     """
-    Devuelve un ChatModel de LangChain según el provider detectado/env.
-
-    ⚠ Azure: Algunos deployments NO aceptan 'temperature' distinto de 1.0.
-      - Si temperature == 1.0 → se envía.
-      - Si temperature es otro valor (e.g., 0.0) → NO se envía (server usa default=1).
+    Prioridad:
+      1) si `sel` tiene alias con ENV mapeada (AZURE_OPENAI_DEPLOYMENT_...), usarla
+      2) si `sel` viene, usar `sel` como deployment
+      3) AZURE_OPENAI_CHAT_DEPLOYMENT o AZURE_OPENAI_DEPLOYMENT_NAME
     """
-    provider = _auto_provider()
-    log.info("llm_factory: provider=%s", provider)
+    if sel:
+        alias = _normalize_alias(sel)
+        if alias in AZURE_ALIASES:
+            env_name = AZURE_ALIASES[alias]["env"]
+            dep = _env(env_name)
+            if dep:
+                return dep
+        return sel
 
-    # ---------------- Azure OpenAI ----------------
-    if provider == "azure":
-        endpoint = _env("AZURE_OPENAI_ENDPOINT")
-        api_key = _env("AZURE_OPENAI_API_KEY")
-        api_version = _env("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
-        # Acepta ambas por compatibilidad:
-        deployment = _env("AZURE_OPENAI_CHAT_DEPLOYMENT") or _env("AZURE_OPENAI_DEPLOYMENT")
+    dep = _env("AZURE_OPENAI_CHAT_DEPLOYMENT") or _env("AZURE_OPENAI_DEPLOYMENT_NAME")
+    if dep:
+        return dep
 
-        if not all([endpoint, api_key, api_version, deployment]):
-            raise RuntimeError(
-                "Faltan vars de Azure OpenAI: "
-                "AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, "
-                "AZURE_OPENAI_API_VERSION, AZURE_OPENAI_CHAT_DEPLOYMENT."
-            )
-
-        kwargs = dict(
-            azure_endpoint=endpoint.rstrip("/"),
-            azure_deployment=deployment,
-            api_version=api_version,
-            api_key=api_key,
-        )
-
-        # Muchos deployments en Azure no aceptan temperature != 1
-        if temperature is not None and abs(float(temperature) - 1.0) < 1e-9:
-            kwargs["temperature"] = 1.0
-        # Si temperature es 0.0 u otro, NO lo incluimos → evita el 400 'unsupported_value'
-
-        return AzureChatOpenAI(**kwargs)
-
-    # ---------------- OpenAI (no Azure) ----------------
-    if provider == "openai":
-        model = _env("OPENAI_CHAT_MODEL", "gpt-4o-mini")
-        base_url = _env("OPENAI_BASE_URL")  # opcional (proxy/self-hosted)
-        api_key = _env("OPENAI_API_KEY")
-
-        if not api_key:
-            raise RuntimeError("Falta OPENAI_API_KEY para provider=openai.")
-
-        kwargs = dict(
-            model=model,
-            api_key=api_key,
-            temperature=float(temperature) if temperature is not None else 0.0,
-        )
-        if base_url:
-            kwargs["base_url"] = base_url.rstrip("/")
-
-        return ChatOpenAI(**kwargs)
-
-    # ---------------- Ollama (fallback local) ----------------
-    # Requiere langchain-community
-    if ChatOllama is None:
-        raise RuntimeError(
-            "Provider=ollama pero 'langchain_community.ChatOllama' no está instalado. "
-            "Instala: pip install 'langchain-community>=0.3.0'"
-        )
-
-    model = _env("OLLAMA_MODEL", "llama3.1:8b-instruct-fp16")
-    base_url = _env("OLLAMA_BASE_URL", "http://localhost:11434")
-    return ChatOllama(
-        model=model,
-        base_url=base_url,
-        temperature=float(temperature or 0.0),
+    options = ", ".join(sorted({d["model_hint"] for d in AZURE_ALIASES.values()}))
+    raise ValueError(
+        "Azure: no se pudo resolver el 'deployment name'. "
+        "Pasa `model=` con el deployment o exporta AZURE_OPENAI_CHAT_DEPLOYMENT. "
+        f"Aliases soportados: {options}"
     )
+
+def _resolve_ollama_model(sel: Optional[str]) -> str:
+    if sel:
+        k = _normalize_alias(sel)
+        return OLLAMA_ALIASES.get(k, sel)
+    return _env("OLLAMA_MODEL", "llama3.2:3b")
+
+# --------------------------- fábrica principal ---------------------------
+
+def get_chat_model(
+    provider: Optional[Literal["azure", "openai", "ollama"]] = None,
+    model: Optional[str] = None,
+    agent_type: Optional[Literal["react", "plan_then_act"]] = None,
+    **kwargs: Any,
+) -> BaseChatModel:
+    """
+    Fábrica unificada (Azure / OpenAI / Ollama).
+    Si `provider` es None, se autodetecta por .env.
+    """
+    provider = (provider or _auto_provider()).lower()
+
+    temperature = kwargs.pop("temperature", 0.0)
+    max_tokens = kwargs.pop("max_tokens", None)
+    timeout = kwargs.pop("timeout", None)
+    max_retries = kwargs.pop("max_retries", 2)
+
+    if provider == "azure":
+        from langchain_openai import AzureChatOpenAI
+        deployment = _resolve_azure_deployment(model or _env("ROS_LG_LLM_MODEL"))
+        api_version = _env("OPENAI_API_VERSION") or _env("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
+        endpoint = _env("AZURE_OPENAI_ENDPOINT")
+        key = _env("AZURE_OPENAI_API_KEY")
+        if not (endpoint and key):
+            raise ValueError("Azure: faltan AZURE_OPENAI_ENDPOINT y/o AZURE_OPENAI_API_KEY.")
+        return AzureChatOpenAI(
+            azure_deployment=deployment,
+            openai_api_version=api_version,
+            azure_endpoint=endpoint,
+            api_key=key,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            max_retries=max_retries,
+            **kwargs,
+        )
+
+    if provider == "openai":
+        from langchain_openai import ChatOpenAI
+        base_url = _env("OPENAI_BASE_URL")
+        key = _env("OPENAI_API_KEY", "dummy-key" if base_url else None)
+        mdl = model or _env("ROS_LG_LLM_MODEL") or _env("OPENAI_MODEL", "gpt-5-mini")
+        if not (key or base_url):
+            raise ValueError("OpenAI: faltan OPENAI_API_KEY o OPENAI_BASE_URL (para servidores compatibles).")
+        return ChatOpenAI(
+            model=mdl,
+            api_key=key,
+            base_url=base_url,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            max_retries=max_retries,
+            **kwargs,
+        )
+
+    if provider == "ollama":
+        try:
+            from langchain_ollama import ChatOllama
+        except Exception:
+            from langchain_community.chat_models import ChatOllama  # type: ignore
+        base_url = _env("OLLAMA_BASE_URL", "http://localhost:11434")
+        mdl = _resolve_ollama_model(model or _env("ROS_LG_LLM_MODEL"))
+        return ChatOllama(
+            model=mdl,
+            base_url=base_url,
+            temperature=temperature,
+            num_ctx=kwargs.pop("num_ctx", 4096),
+            **kwargs,
+        )
+
+    raise ValueError(f"Proveedor desconocido '{provider}'. Usa: azure | openai | ollama.")
