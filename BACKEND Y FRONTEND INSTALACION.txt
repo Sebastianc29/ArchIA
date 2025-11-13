@@ -42,8 +42,7 @@ pip install langgraph-checkpoint-sqlite
 
 
 #En la terminal también hacer
-$env:OPENAI_API_KEY = "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"
-
+$env:OPENAI_API_KEY = ""
 pip install "unstructured[pdf]"
 pip install pdf2image
 pip install poppler-utils   # (en Linux/Mac). En Windows, instala Poppler manualmente.
