@@ -40,22 +40,9 @@ pip install langgraph-checkpoint-sqlite
 #Tambien crear el .env.development y añadir los tokens nuevamente
 #Finalmente, crear el langgraph.json que sea asi:
 
-{
-  "graphs": { "arquia": "./src/graph.py:graph" },
-  "dependencies": ["."],
-  "env": ".env"
-}
-
 
 #En la terminal también hacer
-$env:OPENAI_API_KEY = ""
-gci -r -i *.py | sls -Pattern 'create_or_load_vectorstore\(' -List | % Path 
-#OR
-Get-ChildItem -Path . -Recurse -Include *.py -File |
->>   Where-Object { $_.FullName -notmatch '\\(\.venv|venv|node_modules|\.git)\\' } |      
->>   Select-String -Pattern 'create_or_load_vectorstore\(' -List |
->>   Select-Object -ExpandProperty Path -Unique
-
+$env:OPENAI_API_KEY = "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"
 
 pip install "unstructured[pdf]"
 pip install pdf2image

@@ -7,7 +7,12 @@ from typing_extensions import TypedDict
 from pathlib import Path
 import os, re, json, sqlite3, base64, logging
 from dotenv import load_dotenv, find_dotenv
-
+from src.utils.json_helpers import (
+    extract_json_array,
+    strip_first_json_fence,
+    normalize_tactics_json,
+    build_json_from_markdown,
+)
 # HTTP
 import requests
 from urllib3.util.retry import Retry
@@ -75,6 +80,93 @@ load_dotenv(dotenv_path=find_dotenv('.env.development'))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 log = logging.getLogger("graph")
+# === JSON parse hardening (tácticas) ===
+import json, re
+
+def _coerce_json_array(raw: str):
+    """Intenta extraer un JSON array venga como venga (code-fence, texto suelto, etc.)."""
+    if not raw:
+        return None
+    # 1) helper principal
+    try:
+        from src.utils.json_helpers import extract_json_array
+        arr = extract_json_array(raw)
+        if isinstance(arr, list) and arr:
+            return arr
+    except Exception:
+        pass
+
+    # 2) fence ```json ... ```
+    m = re.search(r"```json\s*(\[.*?\])\s*```", raw, flags=re.I | re.S)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            pass
+
+    # 3) cualquier ``` ... ```
+    m = re.search(r"```\s*(\{[\s\S]*\}|\[[\s\S]*\])\s*```", raw, flags=re.I | re.S)
+    if m:
+        try:
+            obj = json.loads(m.group(1))
+            return obj if isinstance(obj, list) else None
+        except Exception:
+            pass
+
+    # 4) primer array balanceado “best-effort”
+    m = re.search(r"\[([\s\S]*)\]", raw)
+    if m:
+        txt = "[" + m.group(1) + "]"
+        try:
+            obj = json.loads(txt)
+            return obj if isinstance(obj, list) else None
+        except Exception:
+            pass
+
+    return None
+
+# === Esquema y fallback por structured_output ===
+TACTIC_ITEM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "purpose": {"type": "string"},
+        "rationale": {"type": "string"},
+        "risks": {"type": "array", "items": {"type": "string"}},
+        "tradeoffs": {"type": "array", "items": {"type": "string"}},
+        "categories": {"type": "array", "items": {"type": "string"}},
+        "traces_to_asr": {"type": "string"},
+        "expected_effect": {"type": "string"},
+        "success_probability": {"type": "number"},
+        "rank": {"type": "integer"}
+    },
+    "required": ["name","rationale","categories","success_probability","rank"]
+}
+
+TACTICS_ARRAY_SCHEMA = {
+    "type": "array",
+    "minItems": 3,
+    "maxItems": 3,
+    "items": TACTIC_ITEM_SCHEMA
+}
+
+def _structured_tactics_fallback(llm, asr_text: str, qa: str, style_text: str):
+    """Si el modelo no devolvió JSON, fuerza un array JSON válido de 3 tácticas."""
+    prompt = f"""Return exactly THREE tactics that best satisfy this ASR.
+Output ONLY JSON (no prose).
+
+ASR:
+{asr_text}
+
+Primary quality attribute: {qa}
+Selected style: {style_text or "(none)"}"""
+    try:
+        arr = llm.with_structured_output(TACTICS_ARRAY_SCHEMA).invoke(prompt)
+        if isinstance(arr, list) and len(arr) == 3:
+            return arr
+    except Exception as e:
+        log.warning("structured tactics fallback failed: %s", e)
+    return None
 
 BASE_DIR = Path(__file__).resolve().parent.parent  # back/
 STATE_DIR = BASE_DIR / "state_db"
@@ -134,14 +226,21 @@ def _strip_tactics_sections(md: str) -> str:
         text = re.sub(rf"(?is)\n+\s*{h}\s*:?.*$", "\n", text)
     return text.strip()
 
-def _extract_first_json_block(md: str):
-    m = re.search(r"```json\s*(\{.*?\}|\[.*?\])\s*```", md, re.S|re.I)
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(1))
-    except Exception:
-        return None
+# --- Safe JSON example for tactics (avoid braces in f-strings) ---
+TACTICS_JSON_EXAMPLE = """[
+  {
+    "name": "Elastic Horizontal Scaling",
+    "purpose": "Keep p95 checkout latency under 200ms during 10x bursts",
+    "rationale": "Autoscale replicas based on concurrency/CPU to avoid long queues violating the Response Measure",
+    "risks": ["Higher peak spend", "Requires tuned HPA/policies"],
+    "tradeoffs": ["Cost vs. resilience at peak"],
+    "categories": ["scalability","latency","availability"],
+    "traces_to_asr": "Stimulus=10x burst; Response=scale out; Response Measure=p95 < 200ms",
+    "expected_effect": "Throughput increases and p95 stays under target during bursts",
+    "success_probability": 0.82,
+    "rank": 1
+  }
+]"""
 
 # ========== PlantUML helper (LLM)
 
@@ -842,7 +941,7 @@ def asr_node(state: GraphState) -> GraphState:
     directive = "Answer in English." if lang == "en" else "Responde en español."
     # En DOC-ONLY prioriza el documento; si no, add_context
     ctx = (ctx_doc if (doc_only and ctx_doc) else (state.get("add_context") or "")).strip()[:2000]
-
+    
     prompt = f"""{directive}
 You are an expert software architect following Attribute-Driven Design 3.0 (ADD 3.0).
 
@@ -952,10 +1051,6 @@ If you cite facts, keep them realistic and consistent with common production e-c
 
     return state
 
-def _strip_code_block_json(md: str) -> str:
-    # Remueve el primer bloque ```json ... ``` si existe (dejamos solo el Markdown legible)
-    return re.sub(r"```json\s.*?```", "", md, flags=re.S | re.I).strip()
-
 def _guess_quality_attribute(text: str) -> str:
     low = (text or "").lower()
     if "latenc" in low or "response time" in low: return "latency"
@@ -965,6 +1060,39 @@ def _guess_quality_attribute(text: str) -> str:
     if "modifiab" in low or "change" in low:       return "modifiability"
     if "reliab" in low or "fault" in low:          return "reliability"
     return "performance"
+def _json_only_repair_pass(llm, asr_text: str, qa: str, style_text: str, md_preview: str) -> list | None:
+    prompt = f"""You previously wrote tactics in markdown but missed the JSON.
+Return ONLY ONE code fence with a JSON array of EXACTLY 3 objects. No prose.
+
+Schema example (do not copy values, just shape):
+[
+  {{
+    "name": "Tactic name",
+    "purpose": "Short purpose",
+    "rationale": "Why it satisfies the ASR",
+    "risks": ["..."],
+    "tradeoffs": ["..."],
+    "categories": ["scalability","latency"],
+    "traces_to_asr": "Stimulus=..., Response=..., Response Measure=...",
+    "expected_effect": "Short",
+    "success_probability": 0.8,
+    "rank": 1
+  }}
+]
+
+ASR:
+{asr_text}
+
+Primary quality attribute: {qa}
+Selected style: {style_text or "(none)"}
+
+Previous markdown (for grounding):
+{md_preview[:1800]}
+"""
+    resp = llm.invoke(prompt)
+    raw = getattr(resp, "content", str(resp))
+    struct = extract_json_array(raw)
+    return struct if (isinstance(struct, list) and len(struct) >= 1) else None
 
 def tactics_node(state: GraphState) -> GraphState:
     lang = state.get("language", "es")
@@ -983,6 +1111,8 @@ def tactics_node(state: GraphState) -> GraphState:
 
     # 2) Deducimos el atributo de calidad
     qa = state.get("quality_attribute") or _guess_quality_attribute(asr_text)
+    # Estilo (si lo trae el flujo de ESTILOS)
+    style_text = state.get("style") or state.get("selected_style") or state.get("last_style") or ""
 
     # 3) Contexto para grounding: DOC-ONLY → sin RAG; otro caso → RAG normal
     docs_list = []
@@ -1013,7 +1143,7 @@ def tactics_node(state: GraphState) -> GraphState:
         except Exception:
             docs_list = []
         book_snippets = _dedupe_snippets(docs_list, max_items=5, max_chars=600)
-
+    JSON_EXAMPLE = TACTICS_JSON_EXAMPLE
     # 4) Prompt: pedimos Markdown + JSON
     prompt = f"""{directive}
 You are an expert software architect applying Attribute-Driven Design 3.0 (ADD 3.0).
@@ -1029,6 +1159,8 @@ ASR (driver to satisfy):
 
 Primary quality attribute (guessed):
 {qa}
+Selected architecture style (if any):
+{style_text or "(none)"}
 
 
 GROUNDING (use ONLY this context; if DOC-ONLY, this is the exclusive source):
@@ -1038,47 +1170,81 @@ If DOC-ONLY is ON, do not rely on knowledge beyond the PROJECT DOCUMENT even if 
 
 You MUST output THREE sections, in EXACT order:
 
-(0) Why this ASR matters (ADD 3.0 driver):
+(0) Which is the ASR and it´s style (if any):
 - 3–5 concise lines.
-- Explain why this ASR is critical for system success, including user experience, revenue, compliance, or SLO/SLA obligations.
-- Explicitly link back to the ASR's Stimulus, Response, and Response Measure. Example: "If we get a 10x traffic spike (Stimulus) we must keep checkout under 200ms p95 (Response Measure), or we lose conversion."
+- Explicitly link back to the ASR's Source, Stimulus, Artifact, Environment and Response Measure. Also its architectonic style. Example: "The external clients and bots, when a 10x traffic burst during product drop, (checkout API) in a normal operation and one region, the system must keep throughput and protect downstreams with a response measure of p95 < 200ms and error rate < 0.5% using microservices with API gateway and Redis cache."
 
-(1) TACTICS:
-List 6–10 concrete architectural tactics we should consider FIRST in ADD 3.0 to satisfy this ASR.
+(1) TACTICS (TOP-3 with highest success probability):
+Select EXACTLY THREE architectural tactics that maximally satisfy this ASR GIVEN the selected style.
 For EACH tactic include:
-- Name — canonical architecture tactic name (e.g. "Elastic Horizontal Scaling", "Bulkhead Isolation", "Edge Caching", "Circuit Breaker", "Request Throttling / Rate Limiting", "Async Queue + Worker").
-- Rationale — why THIS tactic directly helps satisfy THIS ASR's Response and Response Measure.
-- Consequences / Trade-offs — cost, complexity, operational risk, coupling, vendor lock-in, debugging difficulty, blast radius, etc.
-- When to use — trigger condition in runtime terms (for example: "Use this if traffic spikes 10x in <5 min and you MUST keep p95 checkout under 200ms and avoid cascading failures").
+- Name — canonical tactic name (e.g., "Elastic Horizontal Scaling", "Cache-Aside + TTL", "Circuit Breaker").
+- Rationale — why THIS tactic directly satisfies THIS ASR's Response & Response Measure in THIS style.
+- Consequences / Trade-offs — realistic costs/risks (cost, complexity, ops burden, coupling, failure modes).
+- When to use — explicit runtime trigger/guard (e.g., "if p95 > 200ms during 10x burst for 1 minute, trigger X").
+- Why it ranks in TOP-3 — short argument grounded on ASR + style fit.
+- Sucess probability — numeric estimate [0,1] of success in production.
 
 (2) JSON:
-Finally output ONE ```json code fence with an array of objects like:
-[
-  {{
-    "name": "Elastic Horizontal Scaling",
-    "purpose": "Keep p95 checkout latency under 200ms during 10x traffic bursts",
-    "rationale": "We spin up N replicas automatically so incoming requests never queue long enough to violate the Response Measure",
-    "risks": ["Higher infra spend at peak", "Needs autoscaling rules tuned", "Can expose noisy-neighbor issues if isolation is weak"],
-    "tradeoffs": ["More cost vs better resilience at peak"],
-    "categories": ["scalability","latency","availability"],
-    "traces_to_asr": "Stimulus=10x burst, Response=scale out, Response Measure=p95 < 200ms under burst",
-    "expected_effect": "Checkout stays responsive and revenue is not lost during peak"
-  }}
-]
+Return ONE code fence starting with ```json and ending with ``` that contains ONLY a JSON array with EXACTLY 3 objects.
+- Use dot as decimal separator (e.g., 0.82), never commas.
+- Do not use percent signs, just 0..1 floats for success_probability.
+- Do not add any prose or markdown outside the JSON fence.
+
+Example shape (values are illustrative — adjust to your tactics):
+{JSON_EXAMPLE}
+
 
 STRICT RULES:
 - You MUST behave like ADD 3.0: tactics are chosen BECAUSE OF the ASR's Response and Response Measure, not randomly.
 - Every tactic MUST explicitly tie back to the ASR driver.
 - DO NOT invent product names or vendor SKUs. Stay pattern-level.
 - Keep output concise, production-realistic, and auditable.
+- Output EXACTLY 3 tactics — do not list more than 3.
+- Provide a numeric "success_probability" in [0,1] and a unique "rank" (1..3) consistent with the markdown ranking.
 """
-
     resp = llm.invoke(prompt)
     raw = getattr(resp, "content", str(resp)).strip()
 
-    # 5) Parseamos JSON y preparamos salidas
-    struct = _extract_first_json_block(raw) or []
-    md_only = _strip_code_block_json(raw)
+    # LOG opcional (útil para depurar)
+    log.debug("tactics raw (first 400): %s", raw[:400].replace("\n"," "))
+    log.debug("has ```json fence? %s", bool(re.search(r"```json", raw, re.I)))
+
+    # 5) Parseo + reparación en cascada (solo helpers existentes)
+    struct = extract_json_array(raw) or []
+
+    if not (isinstance(struct, list) and struct):
+        struct = _json_only_repair_pass(
+            llm, asr_text=asr_text, qa=qa, style_text=style_text, md_preview=raw
+        ) or []
+
+    if not (isinstance(struct, list) and struct):
+        struct = build_json_from_markdown(raw, top_n=3)
+
+    # Normaliza a TOP-3 + shape final
+    struct = normalize_tactics_json(struct, top_n=3)
+    log.info(
+    "tactics_struct.len=%s names=%s",
+    len(struct) if isinstance(struct, list) else 0,
+    [it.get("name") for it in (struct or []) if isinstance(it, dict)]
+)
+
+        
+    # Markdown a mostrar (remueve el primer bloque ```json del modelo si vino)
+    md_only = strip_first_json_fence(raw)
+
+    show_json = os.getenv("SHOW_TACTICS_JSON", "0") == "1"
+    if show_json:
+        md_only = f"{md_only}\n\n```json\n{json.dumps(struct, ensure_ascii=False, indent=2)}\n```"
+    else:
+        # si ocultas el JSON, borra el encabezado "(2) JSON:" que queda colgando
+        md_only = re.sub(r"\n?\(?2\)?\s*JSON\s*:?\s*$", "", md_only, flags=re.I|re.M).rstrip()
+
+    # Fallback visual si por alguna razón no hay markdown
+    if (not md_only) and isinstance(struct, list) and struct:
+        md_only = "\n".join(
+            f"- {it.get('name','')}: {it.get('rationale','')}"
+            for it in struct if isinstance(it, dict)
+        )
 
     # 6) Fuentes
     src_lines = []
@@ -1119,8 +1285,8 @@ STRICT RULES:
     state["endMessage"] = md_only
     state["intent"] = "tactics"
     state["nextNode"] = "unifier"
-
-    return {**state, "messages": state["messages"] + msgs}
+    prev_msgs = state.get("messages", [])
+    return {**state, "messages": prev_msgs + state["messages"] + msgs}
 
 
 def researcher_node(state: GraphState) -> GraphState:
