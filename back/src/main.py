@@ -178,6 +178,26 @@ def _wants_diagram_of_that_asr(msg: str) -> bool:
     mentions_that_asr = any(k in low for k in ["that asr", "ese asr", "esa asr", "dicho asr", "ese requisito"])
     return (wants_diagram and mentions_that_asr) or (mentions_component and mentions_that_asr)
 
+def _wants_style(txt: str) -> bool:
+    low = (txt or "").lower()
+    keys = [
+        # EN
+        "architecture style",
+        "architectural style",
+        "style for this asr",
+        "styles for this asr",
+        "style for the asr",
+        "what style", "which style",
+        # ES
+        "estilo de arquitectura",
+        "estilo arquitectónico",
+        "estilos para este asr",
+        "qué estilo", "que estilo",
+    ]
+    # también capturamos frases donde simplemente se combinan "style" y "asr"
+    return any(k in low for k in keys) or ("style" in low and "asr" in low)
+
+
 def _wants_tactics(txt: str) -> bool:
     low = (txt or "").lower()
     keys = [
@@ -352,6 +372,7 @@ async def message(
         f"Quality Attribute: {arch_flow.get('quality_attribute','')}\n"
         f"Business / Context: {arch_flow.get('add_context','')}\n"
         f"Current ASR:\n{arch_flow.get('current_asr','')}\n\n"
+        f"Architecture style: {arch_flow.get('style','')}\n"
         f"Tactics so far: {arch_flow.get('tactics', [])}\n"
         f"User last topic: {last_topic}"
     ).strip() or "N/A"
@@ -382,14 +403,16 @@ async def message(
 
     user_intent = "general"
     if not arch_flow.get("current_asr"):
+        # Si aún no hay ASR, cualquier cosa va a ASR primero
         user_intent = "asr"
+    elif _wants_style(message):
+        # Ya hay ASR y el usuario está pidiendo estilos
+        user_intent = "style"
     elif _wants_tactics(message):
         user_intent = "tactics"
     elif _wants_deployment(message):
         user_intent = "diagram"
 
-    if user_intent == "asr":
-        force_rag = False
 
     # --- Limpieza parcial del estado (sin borrar historial persistente del grafo) ---
     try:
@@ -431,6 +454,9 @@ async def message(
                 "force_rag": force_rag,
                 "topic_hint": topic_hint,  # opcional; el grafo puede ignorarlo
                 "current_asr": memory_get(user_id, "current_asr", ""),
+                "style": arch_flow.get("style", ""),
+                "selected_style": arch_flow.get("style", ""),
+                "last_style": arch_flow.get("style", ""),
                 "arch_stage": arch_flow.get("stage", ""),
                 "quality_attribute": arch_flow.get("quality_attribute", ""),
                 "add_context": arch_flow.get("add_context", ""),
@@ -475,6 +501,17 @@ async def message(
             arch_flow.get("add_context", "")
         )
         arch_flow["stage"] = "ASR"
+
+    style_text = (
+    result.get("style")
+    or result.get("selected_style")
+    or result.get("last_style")
+    )
+
+    if style_text and result.get("arch_stage") == "STYLE":
+        arch_flow["style"] = style_text
+        arch_flow["stage"] = "STYLE"
+
 
     # --- Persistir tácticas si este turno fue de tácticas ---
     tactics_json = result.get("tactics_struct") or None

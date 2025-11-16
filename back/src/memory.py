@@ -40,6 +40,7 @@ def empty_arch_flow() -> dict:
     Estado minimo que queremos recordar entre turnos
     stage:
          ASR: ya tenemos un ASR válido
+         STYLE: ya hay un estilo arquitectonico elegido
          Tactics: ya se discutió las técnicas
          Deployment: ya hay diagrama de despliegue
     """
@@ -48,6 +49,7 @@ def empty_arch_flow() -> dict:
         "quality_attribute": "", # Eje: "availability", "latency"
         "add_context":"", #dominio / driver de negocio
         "current_asr":"", # ASR oficial
+        "style":"", # unico estilo actualmente elegido
         "tactics": [], #Lista de tácticas aceptadas
         "deployment_diagram_puml":"", #PlantUML del despliegue final
         "deployment_diagram_svg_b64":"", #SVG base 64 del despliegue final

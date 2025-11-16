@@ -17,6 +17,7 @@ from src.utils.json_helpers import (
 import requests
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
+import json
 
 # LangChain / LangGraph
 from src.services.llm_factory import get_chat_model
@@ -343,7 +344,7 @@ class GraphState(TypedDict):
     hasVisitedCreator: bool
     hasVisitedEvaluator: bool
     hasVisitedASR: bool
-    nextNode: Literal["investigator", "creator", "evaluator", "diagram_agent", "tactics", "asr", "unifier"]
+    nextNode: Literal["investigator", "creator", "evaluator", "diagram_agent", "tactics", "asr", "style", "unifier"]
     doc_only: bool
     doc_context: str
 
@@ -368,10 +369,10 @@ class GraphState(TypedDict):
 
     # control de idioma/intención/forcing RAG
     language: Literal["en","es"]
-    intent: Literal["general","greeting","smalltalk","architecture","diagram","asr","tactics"]
+    intent: Literal["general","greeting","smalltalk","architecture","diagram","asr","tactics","style"]
     force_rag: bool
 
-    # etapa actual del pipeline ASR -> tacticas -> despliegue
+    # etapa actual del pipeline ASR -> estilos -> tacticas -> despliegue
     arch_stage:str
     quality_attribute:str
     add_context:str
@@ -379,6 +380,10 @@ class GraphState(TypedDict):
     current_asr: str #ASR vigente
     tactics_md: str #salida markdonw del tactics_node
     tactics_struct: list #salida JSON parseada del tactics_node
+
+    style: str #estilo actual
+    selected_style: str
+    last_style: str
 
 class AgentState(TypedDict):
     messages: list
@@ -394,18 +399,39 @@ builder = StateGraph(GraphState)
 
 class supervisorResponse(TypedDict):
     localQuestion: Annotated[str, ..., "What is the question for the worker node?"]
-    nextNode: Literal["investigator", "creator", "evaluator", "diagram_agent", "tactics", "asr", "unifier"]
+    nextNode: Literal[
+        "investigator",
+        "creator",
+        "evaluator",
+        "diagram_agent",
+        "tactics",
+        "asr",
+        "style",
+        "unifier",
+    ]
 
 supervisorSchema = {
     "title": "SupervisorResponse",
     "description": "Response from the supervisor indicating the next node and the setup question.",
     "type": "object",
     "properties": {
-        "localQuestion": {"type": "string", "description": "What is the question for the worker node?"},
+        "localQuestion": {
+            "type": "string",
+            "description": "What is the question for the worker node?"
+        },
         "nextNode": {
             "type": "string",
             "description": "The next node to act.",
-            "enum": ["investigator", "creator", "evaluator", "unifier", "asr", "diagram_agent", "tactics"]
+            "enum": [
+                "investigator",
+                "creator",
+                "evaluator",
+                "unifier",
+                "asr",
+                "diagram_agent",
+                "tactics",
+                "style"          # ← AÑADIDO
+            ]
         }
     },
     "required": ["localQuestion", "nextNode"]
@@ -686,11 +712,13 @@ def analyze_tool(image_path: str, image_path2: str) -> str:
 
 # ========== Router
 
-def router(state: GraphState) -> Literal["investigator","creator","evaluator","diagram_agent","tactics","asr","unifier"]:
+def router(state: GraphState) -> Literal["investigator","creator","evaluator","diagram_agent","tactics","asr","style","unifier"]:
     if state["nextNode"] == "unifier":
         return "unifier"
     elif state["nextNode"] == "asr" and not state.get("hasVisitedASR", False):
         return "asr"
+    if state["nextNode"] == "style":
+        return "style"
     elif state["nextNode"] == "tactics":
         return "tactics"
     elif state["nextNode"] == "investigator" and not state["hasVisitedInvestigator"]:
@@ -790,6 +818,20 @@ def supervisor_node(state: GraphState):
                 "nextNode": "asr",
                 "intent": "asr",
                 "language": state_lang}
+    
+    if forced == "style":
+        return {
+            **state,
+            "localQuestion": uq or (
+                "Selecciona el estilo arquitectónico más adecuado para el ASR actual."
+                if state_lang == "es"
+                else "Select the most appropriate architecture style for the current ASR."
+            ),
+            "nextNode": "style",
+            "intent": "style",
+            "language": state_lang,
+        }
+
     if forced == "tactics":
         return {**state,
                 "localQuestion": ("Propose architecture tactics to satisfy the previous ASR. "
@@ -806,6 +848,15 @@ def supervisor_node(state: GraphState):
 
     # (a partir de aquí, SOLO si no vino intención forzada)
     fu_intent = classify_followup(uq)
+
+        # --- NEW: detectar petición de estilos arquitectónicos ---
+    style_terms = [
+        "style", "styles",
+        "architecture style", "architectural style",
+        "estilo", "estilos", "estilo arquitectónico", "estilos arquitectónicos"
+    ]
+    wants_style = any(t in uq.lower() for t in style_terms)
+
 
     if _looks_like_eval(uq):
         return {**state,
@@ -843,24 +894,36 @@ def supervisor_node(state: GraphState):
 
     intent_val = state.get("intent", "general")
 
-    # 1) ASR primero (no incluir tácticas aquí)
-    if any(x in uq.lower() for x in ["asr", "quality attribute scenario", "qas"]) or fu_intent == "make_asr":
+        # 1) STYLE cuando el usuario lo pide explícitamente
+    if wants_style or fu_intent == "style" or state.get("intent") == "style":
+        next_node = "style"
+        intent_val = "style"
+        local_q = uq or (
+            "Select the most appropriate architecture style for the current ASR."
+            if state_lang == "en"
+            else "Selecciona el estilo arquitectónico más adecuado para el ASR actual."
+        )
+
+    # 2) ASR después (no incluir tácticas aquí)
+    elif any(x in uq.lower() for x in ["asr", "quality attribute scenario", "qas"]) or fu_intent == "make_asr":
         next_node = "asr"
         intent_val = "asr"
         local_q = f"Create a concrete QAS (ASR) for: {state['userQuestion']}"
 
-    # 2) DIAGRAMA cuando lo piden
+    # 3) DIAGRAMA cuando lo piden
     elif wants_diagram or fu_intent in ("component_view", "deployment_view", "functional_view"):
         next_node = "diagram_agent"
         intent_val = "diagram"
         local_q = uq
 
-    # 3) NEW: TÁCTICAS solo cuando el usuario las pide
-    elif wants_tactics or fu_intent in ("explain_tactics", "tactics"):  # NEW
+    # 4) TÁCTICAS solo cuando el usuario las pide
+    elif wants_tactics or fu_intent in ("explain_tactics", "tactics"):
         next_node = "tactics"
         intent_val = "tactics"
-        local_q = ("Propose architecture tactics to satisfy the previous ASR. "
-                   "Explain why each tactic helps and how it ties to the ASR response/measure.")  # NEW
+        local_q = (
+            "Propose architecture tactics to satisfy the previous ASR. "
+            "Explain why each tactic helps and how it ties to the ASR response/measure."
+        )
 
     # 4) Resto
     elif fu_intent in ("compare", "checklist"):
@@ -1051,6 +1114,151 @@ If you cite facts, keep them realistic and consistent with common production e-c
 
     return state
 
+def style_node(state: GraphState) -> GraphState:
+    """
+    Architecture style node (ADD 3.0):
+
+    - Proposes EXACTLY 2 candidate styles.
+    - Evaluates the impact of each one on the ASR.
+    - Recommends one of them.
+    - Stores only the recommended style as the active style in the pipeline.
+    """
+    lang = state.get("language", "es")
+    directive = "Answer in English." if lang == "en" else "Responde en español."
+
+    # 1) Recover ASR, quality attribute, and business context
+    asr_text = (
+        state.get("current_asr")
+        or state.get("last_asr")
+        or (state.get("userQuestion") or "")
+    )
+    qa = state.get("quality_attribute", "")
+    ctx = (state.get("add_context") or "").strip()
+
+    # 2) Prompt: ask for JSON with 2 styles + recommendation (PROMPT 100% IN ENGLISH)
+    prompt = f"""{directive}
+You are a software architect applying ADD 3.0.
+
+Given the following Quality Attribute Scenario (ASR) and its business context,
+propose exactly TWO different architecture styles as reasonable candidates,
+and then recommend which of the two is BETTER to satisfy this ASR,
+explaining the recommendation in terms of its impact on the quality attribute.
+
+Quality attribute focus (e.g., availability, performance, latency, security, etc.):
+{qa}
+
+Business / context:
+{ctx or "(none)"}
+
+ASR:
+{asr_text}
+
+You MUST respond with a VALID JSON object ONLY, with NO extra text, in the following form:
+
+{{
+  "style_1": {{
+    "name": "Short name of style 1 (e.g., 'Layered', 'Microservices')",
+    "impact": "Brief description of how this style impacts the ASR (pros, cons, trade-offs)."
+  }},
+  "style_2": {{
+    "name": "Short name of style 2",
+    "impact": "Brief description of how this style impacts the ASR (pros, cons, trade-offs)."
+  }},
+  "best_style": "style_1 or style_2 (choose ONE)",
+  "rationale": "Explain why the chosen style is better for this ASR, based on its impact."
+}}
+
+Do NOT add comments or any text outside of this JSON object.
+"""
+
+    result = llm.invoke(prompt)
+    raw = getattr(result, "content", str(result))
+
+    # 3) Parse JSON (fallback if it fails)
+    try:
+        data = json.loads(raw)
+    except Exception:
+        # If no valid JSON: at least store one line as style
+        fallback_style = raw.splitlines()[0].strip()
+        state["style"] = fallback_style
+        state["selected_style"] = fallback_style
+        state["last_style"] = fallback_style
+        state["arch_stage"] = "STYLE"
+        state["endMessage"] = raw
+        state["nextNode"] = "unifier"
+        return state
+
+    style1 = data.get("style_1", {}) or {}
+    style2 = data.get("style_2", {}) or {}
+    style1_name = style1.get("name", "").strip() or "Style 1"
+    style2_name = style2.get("name", "").strip() or "Style 2"
+    style1_impact = style1.get("impact", "").strip()
+    style2_impact = style2.get("impact", "").strip()
+    best_key = (data.get("best_style") or "").strip()
+    rationale = data.get("rationale", "").strip()
+
+    if best_key == "style_2":
+        chosen_name = style2_name
+    else:
+        # Default to style_1 if not clear
+        best_key = "style_1"
+        chosen_name = style1_name
+
+    # 4) Store ONLY the recommended style in the ADD 3.0 state
+    state["style"] = chosen_name
+    state["selected_style"] = chosen_name
+    state["last_style"] = chosen_name
+    state["arch_stage"] = "STYLE"
+
+    # Update rich memory (long-term text)
+    prev_mem = state.get("memory_text", "") or ""
+    state["memory_text"] = (
+        prev_mem
+        + f"\n\n[STYLE_OPTIONS]\n1) {style1_name}\n2) {style2_name}\n"
+        + f"[STYLE_CHOSEN]\n{chosen_name}\n"
+    ).strip()
+
+    # 5) Build user-facing message (in ES or EN)
+    if lang == "es":
+        header = "He identificado dos estilos arquitectónicos candidatos para tu ASR:"
+        rec_label = "Recomendación"
+        because = "porque"
+        followups = [
+            f"Explícame tácticas concretas para el ASR usando el estilo recomendado ({chosen_name}).",
+            "Compárame más a fondo estos dos estilos para este ASR.",
+            "Genera un diagrama de componentes o despliegue alineado con el estilo recomendado.",
+        ]
+    else:
+        header = "I have identified two candidate architecture styles for your ASR:"
+        rec_label = "Recommendation"
+        because = "because"
+        followups = [
+            f"Explain concrete tactics for the ASR using the recommended style ({chosen_name}).",
+            "Compare these two styles in more depth for this ASR.",
+            "Generate a component or deployment diagram aligned with the recommended style.",
+        ]
+
+    content = (
+        f"{header}\n\n"
+        f"1) {style1_name}\n"
+        f"   - Impact: {style1_impact}\n\n"
+        f"2) {style2_name}\n"
+        f"   - Impact: {style2_impact}\n\n"
+        f"{rec_label}: **{chosen_name}** {because}:\n"
+        f"{rationale}\n"
+    )
+
+    state["turn_messages"] = state.get("turn_messages", []) + [
+        {"role": "assistant", "name": "style_recommender", "content": content}
+    ]
+    state["suggestions"] = followups
+    state["endMessage"] = content
+    state["nextNode"] = "unifier"
+
+    return state
+
+
+
 def _guess_quality_attribute(text: str) -> str:
     low = (text or "").lower()
     if "latenc" in low or "response time" in low: return "latency"
@@ -1223,10 +1431,10 @@ STRICT RULES:
     # Normaliza a TOP-3 + shape final
     struct = normalize_tactics_json(struct, top_n=3)
     log.info(
-    "tactics_struct.len=%s names=%s",
-    len(struct) if isinstance(struct, list) else 0,
-    [it.get("name") for it in (struct or []) if isinstance(it, dict)]
-)
+        "tactics_struct.len=%s names=%s",
+        len(struct) if isinstance(struct, list) else 0,
+        [it.get("name") for it in (struct or []) if isinstance(it, dict)]
+    )
 
         
     # Markdown a mostrar (remueve el primer bloque ```json del modelo si vino)
@@ -1286,7 +1494,7 @@ STRICT RULES:
     state["intent"] = "tactics"
     state["nextNode"] = "unifier"
     prev_msgs = state.get("messages", [])
-    return {**state, "messages": prev_msgs + state["messages"] + msgs}
+    return {**state, "messages": prev_msgs + msgs}
 
 
 def researcher_node(state: GraphState) -> GraphState:
@@ -1315,6 +1523,7 @@ def researcher_node(state: GraphState) -> GraphState:
             "messages": state["messages"] + [AIMessage(content=note, name="researcher")],
             "hasVisitedInvestigator": True
         }
+
 
     # saludo sin RAG
     if intent in ("greeting", "smalltalk"):
@@ -1625,7 +1834,41 @@ Next:
 - """ + "\n- ".join(tips)
         state["suggestions"] = tips
         return {**state, "endMessage": end_text, "intent": "diagram"}
+        # Mostrar el diagrama si existe
+    d = state.get("diagram") or {}
+    if d.get("ok") and d.get("svg_b64"):
+        ...
+        return {**state, "endMessage": end_text, "intent": "diagram"}
     
+    # 🔴 NUEVO: Caso especial para ESTILOS
+    if intent == "style":
+        style_txt = (
+            _last_ai_by(state, "style_recommender")
+            or state.get("endMessage")
+            or "No style content."
+        )
+
+        if lang == "es":
+            followups = state.get("suggestions") or [
+                "Explícame tácticas concretas para el ASR usando el estilo recomendado.",
+                "Compárame más a fondo estos dos estilos para este ASR.",
+                "Genera un diagrama de componentes o despliegue alineado con el estilo recomendado.",
+            ]
+        else:
+            followups = state.get("suggestions") or [
+                "Explain concrete tactics for the ASR using the recommended style.",
+                "Compare these two styles in more depth for this ASR.",
+                "Generate a component or deployment diagram aligned with the recommended style.",
+            ]
+
+        state["suggestions"] = followups
+        state["turn_messages"] = state.get("turn_messages", []) + [
+            {"role": "assistant", "name": "unifier", "content": style_txt}
+        ]
+
+        # Muy importante: devolvemos SOLO el texto de estilos, sin "Answer:" ni "Next:"
+        return {**state, "endMessage": style_txt}
+
     # Caso especial: TÁCTICAS
     if intent == "tactics":
         tactics_md = state.get("tactics_md") or _last_ai_by(state, "tactics_advisor") or "No tactics content."
@@ -1758,7 +2001,7 @@ SOURCE:
 
 class ClassifyOut(TypedDict):
     language: Literal["en","es"]
-    intent: Literal["greeting","smalltalk","architecture","diagram","asr","tactics","other"]
+    intent: Literal["greeting","smalltalk","architecture","diagram","asr","tactics","style","other"]
     use_rag: bool
 
 def classifier_node(state: GraphState) -> GraphState:
@@ -1766,7 +2009,7 @@ def classifier_node(state: GraphState) -> GraphState:
     prompt = f"""
 Classify the user's last message. Return JSON with:
 - language: "en" or "es"
-- intent: one of ["greeting","smalltalk","architecture","diagram","asr","tactics","other"]
+- intent: one of ["greeting","smalltalk","architecture","diagram","asr","tactics","style","other"]
 - use_rag: true if this is a software-architecture question (ADD, tactics, latency, scalability,
   quality attributes, views, styles, diagrams, ASR), else false.
 
@@ -1777,6 +2020,17 @@ User message:
 
     low = msg.lower()
     intent = out["intent"]
+
+    #disparadores de estilo arquitectónico
+    style_triggers = [
+        "style", "styles",
+        "architecture style", "architectural style",
+        "estilo", "estilos", "estilo arquitectónico", "estilos arquitectónicos"
+    ]
+    if any(k in low for k in style_triggers):
+        intent = "style"
+
+
     tactics_triggers = [
         "tactic", "táctica", "tactica", "tácticas", "tactics", "tactcias",
         "strategy","estrategia",
@@ -1790,13 +2044,24 @@ User message:
         "uml", "plantuml", "c4", "bpmn",
         "this asr", "este asr", "el asr", "ese asr", "anterior asr"
     ]
-    if any(k in low for k in diagram_triggers) and intent != "asr":
+    # No pises estilo ni ASR cuando solo dicen "this ASR"
+    if any(k in low for k in diagram_triggers) and intent not in ("asr", "style"):
         intent = "diagram"
+
 
     return {
         **state,
         "language": out["language"],
-        "intent": intent if intent in ["greeting","smalltalk","architecture","diagram","asr","tactics"] else "general",
+        "intent": intent if intent in [
+        "greeting",
+        "smalltalk",
+        "architecture",
+        "diagram",
+        "asr",
+        "tactics",
+        "style",
+    ] else "general",
+
         "force_rag": bool(out["use_rag"]),
     }
 
@@ -1825,6 +2090,7 @@ builder.add_node("diagram_agent", diagram_orchestrator_node)  # Orquestador
 builder.add_node("evaluator", evaluator_node)
 builder.add_node("unifier", unifier_node)
 builder.add_node("asr", asr_node)
+builder.add_node("style", style_node) 
 builder.add_node("tactics", tactics_node)
 
 
@@ -1838,6 +2104,7 @@ builder.add_edge("creator", "supervisor")
 builder.add_edge("diagram_agent", "supervisor")
 builder.add_edge("evaluator", "supervisor")
 builder.add_edge("asr", "unifier")
+builder.add_edge("style", "unifier")
 builder.add_edge("tactics", "unifier")
 builder.add_edge("unifier", END)
 
