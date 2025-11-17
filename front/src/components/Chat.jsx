@@ -185,6 +185,9 @@ function AssistantMessage({ text, pending }) {
 /* ======================= Chat ======================= */
 export default function Chat() {
   const [drawerOpen, setDrawerOpen] = useState(false);
+  // Popup de onboarding al abrir el chat
+  const [showOnboarding, setShowOnboarding] = useState(true);
+
   useEffect(() => {
     const handler = () => setDrawerOpen((p) => !p);
     window.addEventListener("arquia-toggle-drawer", handler);
@@ -305,9 +308,9 @@ export default function Chat() {
               session_id: data?.session_id || sessionId,
               message_id: data?.message_id,
               diagram: diagram || data?.diagram || null,
-              suggestions: Array.isArray(data?.suggestions) && data?.suggestions.length > 0
+              suggestions: Array.isArray(data?.suggestions)
                 ? data.suggestions
-                : parseNextFromText(textOut)
+                : []
             }
           : m
       );
@@ -324,7 +327,7 @@ export default function Chat() {
   };
 
   const onSuggestionClick = (sugg) => { if (!isBusy) sendMessage(sugg); };
-
+  
   const handleThumbClick = (sid, mid, thumbs_up, thumbs_down) => {
     const form = new FormData();
     form.append("session_id", sid);
@@ -420,6 +423,71 @@ export default function Chat() {
 
   return (
     <Box className="chat-root" sx={{ background: "#111", minHeight: "100vh" }}>
+      {showOnboarding && (
+        <Box
+          sx={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 2000,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            bgcolor: "rgba(0,0,0,0.6)",
+          }}
+        >
+          <Paper
+            sx={{
+              maxWidth: 520,
+              mx: 2,
+              p: 3,
+              borderRadius: 2,
+              background: "#111827",
+              color: "#fff",
+              position: "relative",
+              border: "1px solid rgba(148,163,184,0.6)",
+            }}
+          >
+            <IconButton
+              size="small"
+              onClick={() => setShowOnboarding(false)}
+              sx={{ position: "absolute", top: 8, right: 8, color: "rgba(255,255,255,0.7)" }}
+            >
+              <CloseIcon fontSize="small" />
+            </IconButton>
+
+            <Typography variant="h6" sx={{ mb: 1.5, fontWeight: 600 }}>
+              Bienvenida/o a ArchIA (ADD 3.0)
+            </Typography>
+
+            <Typography variant="body2" sx={{ mb: 1.5 }}>
+              ArchIA te guía con el método <strong>Attribute-Driven Design 3.0</strong>:
+            </Typography>
+
+            <Typography variant="body2" component="div" sx={{ mb: 1.5 }}>
+              <ul style={{ paddingLeft: "1.2rem", margin: 0 }}>
+                <li><strong>ASR:</strong> formula el escenario de atributo de calidad.</li>
+                <li><strong>Estilo:</strong> pide estilos arquitectónicos adecuados para ese ASR.</li>
+                <li><strong>Tácticas:</strong> selecciona tácticas que satisfacen ese ASR y ese estilo.</li>
+                <li><strong>Diagrama:</strong> genera diagramas a partir del ASR + estilo + tácticas.</li>
+              </ul>
+            </Typography>
+
+            <Typography variant="body2" sx={{ mb: 2 }}>
+              Usa los botones de sugerencias debajo de cada respuesta para seguir este flujo paso a paso.
+            </Typography>
+
+            <Box sx={{ display: "flex", justifyContent: "flex-end" }}>
+              <Button
+                variant="contained"
+                size="small"
+                onClick={() => setShowOnboarding(false)}
+              >
+                Entendido
+              </Button>
+            </Box>
+          </Paper>
+        </Box>
+      )}
       <Drawer anchor="left" open={drawerOpen} onClose={() => setDrawerOpen(false)} PaperProps={{ sx: { background: "transparent" } }}>
         {DrawerContent}
       </Drawer>

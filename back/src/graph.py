@@ -993,7 +993,7 @@ def asr_node(state: GraphState) -> GraphState:
     docs_list = []
     if state.get("force_rag", False) and not doc_only:
         try:
-            query = f"{concern} quality attribute scenario latency measure stimulus environment artifact response measure"
+            query = f"{concern} quality attribute scenario latency measure stimulus environment artifact response response measure"
             docs_raw = list(retriever.invoke(query))
             docs_list = docs_raw[:6]
         except Exception:
@@ -1002,55 +1002,24 @@ def asr_node(state: GraphState) -> GraphState:
     book_snippets = _dedupe_snippets(docs_list, max_items=6, max_chars=800)
 
     directive = "Answer in English." if lang == "en" else "Responde en español."
-    # En DOC-ONLY prioriza el documento; si no, add_context
     ctx = (ctx_doc if (doc_only and ctx_doc) else (state.get("add_context") or "")).strip()[:2000]
-    
+
+    # 💡 NUEVO FORMATO: ASR complete + secciones planas
     prompt = f"""{directive}
 You are an expert software architect following Attribute-Driven Design 3.0 (ADD 3.0).
 
-If DOC-ONLY mode is ON, you MUST base your answer ONLY on the PROJECT DOCUMENT below.
-If the document lacks necessary data, say so explicitly and ask for a more detailed document.
+Your job is to create ONE concrete Quality Attribute Scenario (Architecture Significant Requirement, ASR)
+that will be used as an architectural driver.
 
-Your job is to create ONE concrete Quality Attribute Scenario (also called an Architecture Significant Requirement, ASR) that will be used as an architectural driver in ADD 3.0.
+The scenario MUST:
+- Follow the classic QAS structure: Source, Stimulus, Environment, Artifact, Response, Response Measure.
+- Be measurable, with a clear Response Measure (SLO/SLA, e.g. p95 < X ms under Y load, error rate, availability, etc.).
+- Be realistic for production systems in the given domain.
 
-STRICT REQUIREMENTS:
-- You MUST follow ADD 3.0. If you do not follow ADD 3.0, the answer is invalid.
-- The scenario MUST be measurable, and it MUST include a clear Response Measure (SLO/SLA/threshold, like p95 < X ms under Y load).
-- The scenario MUST be directly usable to drive architectural tactics in the next step.
-- Stay realistic for production systems. Prefer numbers that could actually be monitored.
-
-Use ONLY these sections, in this exact order, with plain text (NO Markdown bullets, NO code fences):
-
-Architectural Driver Summary (ADD 3.0):
-  Briefly explain:
-  - Which business/mission need or operating context makes this scenario critical.
-  - Which quality attribute is at stake (e.g. scalability, latency, availability).
-  - Why this scenario is a top driver the team MUST satisfy first.
-
-Summary:
-  One sentence that captures the main quality attribute goal in this domain.
-
-Context:
-  One short paragraph with business/technical context (users, peak conditions, why failure hurts revenue/compliance/UX).
-
-Scenario:
-  Source:
-  Stimulus:
-  Environment:
-  Artifact:
-  Response:
-  Response Measure:
-
-Rules:
-- Response is what the system must do.
-- Response Measure is how we verify success quantitatively (p95, p99, throughput, failover time, error budget, etc.).
-- These fields MUST be consistent with ADD 3.0 quality attribute scenario templates (Source, Stimulus, Environment, Artifact, Response, Response Measure).
-- Do NOT include "tactics", "design", "next steps", "recommendations", or any implementation details here. That comes later.
-
-Relevant domain or workload:
+Relevant domain or workload (you must stay coherent with this):
 {domain}
 
-Quality attribute focus I detected from the user message:
+Quality attribute focus inferred from the user message:
 {concern}
 
 User input to ground this ASR:
@@ -1059,13 +1028,35 @@ User input to ground this ASR:
 PROJECT CONTEXT (if any):
 {ctx or "None"}
 
-If you cite facts, keep them realistic and consistent with common production e-commerce / API scaling practice.
+OPTIONAL BOOK CONTEXT (only if not in DOC-ONLY mode):
+{book_snippets or "None"}
+
+OUTPUT FORMAT (MANDATORY – no bullets, no Markdown headings, no extra commentary):
+
+ASR complete: <one single sentence that concisely states Source, Stimulus, Environment, Artifact, Response and Response Measure in natural language>
+
+Scenario:
+Source: <who initiates the stimulus>
+Stimulus: <what happens / event that triggers the behavior>
+Environment: <when / in which operating conditions this happens>
+Artifact: <what part of the system is stimulated>
+Response: <what the system must do>
+Response Measure: <how success is measured with clear numeric thresholds>
+
+Rules:
+- The line that starts with "ASR complete:" MUST be a single sentence.
+- Then a blank line.
+- Then the section "Scenario:" in its own line and each of the six fields (Source, Stimulus, Environment, Artifact, Response, Response Measure)
+  on its own line exactly as shown above.
+- Do NOT add any other sections (no 'Architectural Driver Summary', no 'Summary', no 'Context' headings).
+- Do NOT talk about tactics, styles or next steps here.
+- Keep the numbers realistic and monitorable (p95 / p99, RPS, error rate, availability, etc.).
+- Answer entirely in the requested language.
 """
 
     result = llm.invoke(prompt)
     content_raw = getattr(result, "content", str(result))
     content = _sanitize_plain_text(content_raw)
-    # quita secciones de tácticas si el modelo las metió
     content = _strip_tactics_sections(content)
 
     # === Fuentes (si hubo RAG) ===
@@ -1096,21 +1087,22 @@ If you cite facts, keep them realistic and consistent with common production e-c
 
     # Memoria viva del chat
     state["last_asr"] = content
-    refs_list = [ln.lstrip("- ").strip() for ln in src_block.splitlines() if ln.strip() and not ln.lower().startswith("sources")]
+    refs_list = [ln.lstrip("- ").strip() for ln in src_block.splitlines()
+                 if ln.strip() and not ln.lower().startswith("sources")]
     state["asr_sources_list"] = refs_list
     prev_mem = state.get("memory_text", "") or ""
     state["memory_text"] = (prev_mem + f"\n\n[LAST_ASR]\n{content}\n").strip()
 
-    # Exponer metadata clave del ASR para que main.py la persista (ojo al typo)
-    state["quality_attribute"] = concern           # corregido
-    state["arch_stage"] = "ASR"                   # estamos en la etapa de definir driver ADD 3.0
-    state["current_asr"] = content                # copia directa del ASR final
+    # Metadatos
+    state["quality_attribute"] = concern
+    state["arch_stage"] = "ASR"
+    state["current_asr"] = content
 
-    # Señales para cortar el turno y NO volver a investigar
+    # Señales de fin de turno
     state["endMessage"] = content
     state["hasVisitedASR"] = True
     state["force_rag"] = False
-    state["nextNode"] = "unifier"                      # cierra en unifier
+    state["nextNode"] = "unifier"
 
     return state
 
@@ -1226,7 +1218,6 @@ Do NOT add comments or any text outside of this JSON object.
         followups = [
             f"Explícame tácticas concretas para el ASR usando el estilo recomendado ({chosen_name}).",
             "Compárame más a fondo estos dos estilos para este ASR.",
-            "Genera un diagrama de componentes o despliegue alineado con el estilo recomendado.",
         ]
     else:
         header = "I have identified two candidate architecture styles for your ASR:"
@@ -1235,8 +1226,7 @@ Do NOT add comments or any text outside of this JSON object.
         followups = [
             f"Explain concrete tactics for the ASR using the recommended style ({chosen_name}).",
             "Compare these two styles in more depth for this ASR.",
-            "Generate a component or deployment diagram aligned with the recommended style.",
-        ]
+            ]
 
     content = (
         f"{header}\n\n"
@@ -1817,30 +1807,36 @@ def unifier_node(state: GraphState) -> GraphState:
     lang = state.get("language", "es")
     intent = state.get("intent", "general")
 
-    # Mostrar el diagrama si existe
+    # 0) Mostrar el diagrama si existe (intención "diagram")
     d = state.get("diagram") or {}
     if d.get("ok") and d.get("svg_b64"):
         data_url = f'data:image/svg+xml;base64,{d["svg_b64"]}'
-        head = "Aquí tienes el diagrama solicitado:" if lang=="es" else "Here is your requested diagram:"
-        tips = [
-            "¿Quieres el mismo diagrama en PNG?" if lang=="es" else "Do you want this diagram as PNG?",
-            "¿Genero también una vista de despliegue?" if lang=="es" else "Generate a Deployment view too?",
-            "¿Deseas ver/editar el código fuente?" if lang=="es" else "Want to see/edit the diagram source?"
-        ]
+        if lang == "es":
+            head = "Aquí tienes el diagrama solicitado:"
+            footer = "¿Qué te gustaría hacer ahora con este diagrama?"
+            tips = [
+                "Generar un diagrama de componentes a partir de este sistema.",
+                "Generar un diagrama de despliegue para este mismo sistema.",
+                "Formular un nuevo ASR basado en este sistema.",
+            ]
+        else:
+            head = "Here is your requested diagram:"
+            footer = "What would you like to do next with this diagram?"
+            tips = [
+                "Generate a component diagram from this system.",
+                "Generate a deployment diagram for this same system.",
+                "Define a new ASR based on this system.",
+            ]
+
         end_text = f"""{head}
 ![diagram]({data_url})
 
-Next:
-- """ + "\n- ".join(tips)
+{footer}
+"""
         state["suggestions"] = tips
         return {**state, "endMessage": end_text, "intent": "diagram"}
-        # Mostrar el diagrama si existe
-    d = state.get("diagram") or {}
-    if d.get("ok") and d.get("svg_b64"):
-        ...
-        return {**state, "endMessage": end_text, "intent": "diagram"}
-    
-    # 🔴 NUEVO: Caso especial para ESTILOS
+
+    # 🔴 Caso especial para ESTILOS
     if intent == "style":
         style_txt = (
             _last_ai_by(state, "style_recommender")
@@ -1850,38 +1846,45 @@ Next:
 
         if lang == "es":
             followups = state.get("suggestions") or [
-                "Explícame tácticas concretas para el ASR usando el estilo recomendado.",
+                "Diseña tácticas concretas para este ASR usando el estilo recomendado.",
                 "Compárame más a fondo estos dos estilos para este ASR.",
-                "Genera un diagrama de componentes o despliegue alineado con el estilo recomendado.",
             ]
         else:
             followups = state.get("suggestions") or [
-                "Explain concrete tactics for the ASR using the recommended style.",
+                "Explain concrete tactics for this ASR using the recommended style.",
                 "Compare these two styles in more depth for this ASR.",
-                "Generate a component or deployment diagram aligned with the recommended style.",
             ]
 
         state["suggestions"] = followups
         state["turn_messages"] = state.get("turn_messages", []) + [
             {"role": "assistant", "name": "unifier", "content": style_txt}
         ]
-
-        # Muy importante: devolvemos SOLO el texto de estilos, sin "Answer:" ni "Next:"
         return {**state, "endMessage": style_txt}
 
-    # Caso especial: TÁCTICAS
+    # 🔴 Caso especial para TÁCTICAS
     if intent == "tactics":
-        tactics_md = state.get("tactics_md") or _last_ai_by(state, "tactics_advisor") or "No tactics content."
+        tactics_md = (
+            state.get("tactics_md")
+            or _last_ai_by(state, "tactics_advisor")
+            or "No tactics content."
+        )
         src_txt = _last_ai_by(state, "tactics_sources")
         refs_block = _extract_rag_sources_from(src_txt) if src_txt else "None"
 
-        followups = [
-            "¿Genero un diagrama de componentes aplicando estas tácticas?" if lang=="es" else "Generate a component diagram applying these tactics?",
-            "¿Convertimos estas tácticas en criterios de pruebas no funcionales?" if lang=="es" else "Turn these tactics into non-functional test criteria?",
-            "¿Quieres una estimación de riesgos/costos por táctica?" if lang=="es" else "Estimate risks/costs per tactic?",
-            "¿Mapeamos táctica → componente/servicio concreto?" if lang=="es" else "Map tactic → concrete component/service?"
-        ]
-        end_text = f"{tactics_md}\n\nReferences:\n{refs_block}\n\nNext:\n- " + "\n- ".join(followups)
+        if lang == "es":
+            followups = [
+                "Genera un diagrama de componentes aplicando estas tácticas.",
+                "Genera un diagrama de despliegue alineado con estas tácticas.",
+            ]
+            refs_label = "Referencias"
+        else:
+            followups = [
+                "Generate a component diagram applying these tactics.",
+                "Generate a deployment diagram aligned with these tactics.",
+            ]
+            refs_label = "References"
+
+        end_text = f"{tactics_md}\n\n{refs_label}:\n{refs_block}"
 
         state["suggestions"] = followups
         state["turn_messages"] = state.get("turn_messages", []) + [
@@ -1889,28 +1892,33 @@ Next:
         ]
         return {**state, "endMessage": end_text}
 
-
-    # 1) Caso especial: ASR
-    if intent == "asr":
-        raw_asr = _last_ai_by(state, "asr_recommender") or "No ASR content found for this turn."
-        #si el LLM coló tácticas, las quitamos del ASR
+    # 🔴 Caso especial para ASR
+    if intent == "asr" or intent == "ASR":
+        raw_asr = (
+            _last_ai_by(state, "asr_recommender")
+            or state.get("endMessage")
+            or "No ASR content found for this turn."
+        )
+        # si el LLM coló tácticas, las quitamos del ASR
         last_asr = _strip_tactics_sections(raw_asr)
 
         asr_src_txt = _last_ai_by(state, "asr_sources")
         refs_block = _extract_rag_sources_from(asr_src_txt) if asr_src_txt else "None"
 
-        followups = [
-            "¿Quieres un diagrama de componentes específico para este ASR?" if lang=="es" else "Want a component diagram for THIS ASR?",
-            "¿Validamos despliegue/hosting para cumplir el ASR?" if lang=="es" else "Check a Deployment/hosting plan to meet the ASR?",
-            "¿Comparamos latencia vs. escalabilidad para este dominio?" if lang=="es" else "Compare latency vs scalability for this domain?",
-            "¿Convertimos este ASR en criterios de pruebas?" if lang=="es" else "Turn this ASR into test criteria?",
-        ]
+        if lang == "es":
+            followups = [
+                "Propón estilos arquitectónicos para este ASR.",
+                "Refina este ASR con métricas y escenarios más específicos.",
+            ]
+            refs_label = "Referencias"
+        else:
+            followups = [
+                "Propose architecture styles for this ASR.",
+                "Refine this ASR with more specific metrics and scenarios.",
+            ]
+            refs_label = "References"
 
-        end_text = (
-            f"{last_asr}\n\n"
-            f"References:\n{refs_block}\n\n"
-            "Next:\n- " + "\n- ".join(followups)
-        )
+        end_text = f"{last_asr}\n\n{refs_label}:\n{refs_block}"
 
         state["turn_messages"] = state.get("turn_messages", []) + [
             {"role": "assistant", "name": "unifier", "content": end_text}
@@ -1918,26 +1926,38 @@ Next:
         state["suggestions"] = followups
         return {**state, "endMessage": end_text}
 
-
-    # 2) Caso especial: saludo / smalltalk
+    # 🔴 Caso especial: saludo / smalltalk
     if intent in ("greeting", "smalltalk"):
-        hello = "¡Hola! ¿Sobre qué tema de arquitectura quieres profundizar?" if lang=="es" \
-                else "Hi! What software-architecture topic would you like to explore?"
-        nexts = [
-            "Latency tactics vs scalability?",
-            "Create a deployment view for my web app?",
-            "Give me a scalability ASR example?",
-            "Compare event-driven vs request/response?",
-        ]
-        end_text = hello + "\n\nNext:\n- " + "\n- ".join(nexts)
+        if lang == "es":
+            hello = "¡Hola! ¿Sobre qué tema de arquitectura quieres profundizar?"
+            nexts = [
+                "Formular un ASR (requerimiento de calidad) para mi sistema.",
+                "Revisar un ASR que ya tengo.",
+            ]
+            footer = (
+                "Si quieres, podemos empezar el ciclo ADD 3.0 formulando "
+                "un ASR (por ejemplo de latencia, disponibilidad o seguridad)."
+            )
+        else:
+            hello = "Hi! What software-architecture topic would you like to explore?"
+            nexts = [
+                "Define an ASR (quality attribute requirement) for my system.",
+                "Review an ASR I already have.",
+            ]
+            footer = (
+                "If you want, we can start the ADD 3.0 cycle by defining "
+                "an ASR (for example latency, availability or security)."
+            )
+
+        end_text = hello + "\n\n" + footer
         state["suggestions"] = nexts
         return {**state, "endMessage": end_text}
 
-    # 3) Compacto por defecto
+    # 🔵 Caso por defecto: síntesis de investigador / evaluador / etc.
     researcher_txt = _last_ai_by(state, "researcher")
-    evaluator_txt  = _last_ai_by(state, "evaluator")
-    creator_txt    = _last_ai_by(state, "creator")
-    asr_src_txt    = _last_ai_by(state, "asr_sources")
+    evaluator_txt = _last_ai_by(state, "evaluator")
+    creator_txt = _last_ai_by(state, "creator")
+    asr_src_txt = _last_ai_by(state, "asr_sources")
 
     rag_refs = ""
     if researcher_txt:
@@ -1946,29 +1966,32 @@ Next:
     memory_hint = state.get("memory_text", "")
 
     buckets = []
-    if researcher_txt: buckets.append(f"researcher:\n{researcher_txt}")
-    if evaluator_txt:  buckets.append(f"evaluator:\n{evaluator_txt}")
-    if creator_txt and intent == "diagram": buckets.append(f"creator:\n{creator_txt}")
-    if asr_src_txt: buckets.append(f"asr_sources:\n{asr_src_txt}")
+    if researcher_txt:
+        buckets.append(f"researcher:\n{researcher_txt}")
+    if evaluator_txt:
+        buckets.append(f"evaluator:\n{evaluator_txt}")
+    if creator_txt and intent == "diagram":
+        buckets.append(f"creator:\n{creator_txt}")
+    if asr_src_txt:
+        buckets.append(f"asr_sources:\n{asr_src_txt}")
 
-    synthesis_source = "User question:\n" + (state.get("userQuestion","")) + "\n\n" + "\n\n".join(buckets)
+    synthesis_source = (
+        "User question:\n"
+        + (state.get("userQuestion", ""))
+        + "\n\n"
+        + "\n\n".join(buckets)
+    )
 
-    directive = "Responde en español." if lang=="es" else "Answer in English."
+    directive = "Responde en español." if lang == "es" else "Answer in English."
     prompt = f"""{directive}
-You are writing the FINAL chat reply. Produce **compact output** with three sections ONLY and no Markdown headers:
+You are writing the FINAL chat reply.
 
-Answer:
 - Give a complete, direct solution tailored to the question and context.
-- 6–12 concise lines (bullets or short sentences). No code fences, no mermaid.
-
-References:
-- If RAG_SOURCES has entries, list 3–6 relevant items (short, one per line). If empty, write "None".
-
-Next:
-- 3–5 short, context-aware follow-up questions to continue THIS conversation.
+- Use 6–12 concise lines (bullets or short sentences). No code fences, no mermaid.
+- If useful, at the end include a short 'References:' block listing 3–6 items from RAG_SOURCES (one per line). If not useful, you may omit it.
 
 Constraints:
-- Use the user's language for all sections.
+- Use the user's language.
 - Do not invent sources outside RAG_SOURCES.
 - Keep it clean: no '#', no '**', no code blocks.
 
@@ -1980,6 +2003,7 @@ RAG_SOURCES:
 SOURCE:
 {synthesis_source}
 """
+
     resp = llm.invoke(prompt)
     final_text = getattr(resp, "content", str(resp))
     final_text = _strip_all_markdown(final_text)
@@ -1989,8 +2013,9 @@ SOURCE:
     if secs.get("Next"):
         for ln in secs["Next"].splitlines():
             ln = ln.strip(" -•\t")
-            if ln: chips.append(ln)
-    state["suggestions"] = chips[:6] if chips else state.get("suggestions", [])
+            if ln:
+                chips.append(ln)
+    state["suggestions"] = chips[:6] if chips else []
 
     _push_turn(state, role="system", name="unifier_system", content=prompt)
     _push_turn(state, role="assistant", name="unifier", content=final_text)
