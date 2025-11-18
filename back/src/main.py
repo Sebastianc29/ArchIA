@@ -8,7 +8,6 @@ from fastapi import UploadFile, File, Form, HTTPException, Request, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
-from .routers.diagram import router as diagram_router
 
 from langchain_core.messages import HumanMessage
 from src.graph import graph
@@ -21,7 +20,6 @@ from src.memory import (
     save_arch_flow,
 )
 from src.services.doc_ingest import extract_pdf_text
-from src.clients.kroki_client import render_kroki_sync
 from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv())
 memory_init()
@@ -110,7 +108,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(diagram_router)
 
 # ===================== Helpers de tema ===================
 def _normalize_topic(xx: str) -> str:
@@ -218,59 +215,6 @@ def _wants_deployment(txt: str) -> bool:
     ]
     return any(k in low for k in keys)
 
-
-# ====== Fallback builder (solo cuando lo piden o falta) ======
-def _build_component_puml_from_text(text: str, title_hint: str = "") -> str:
-    t = (text or "").lower()
-    def has(*kw): return any(k in t for k in kw)
-
-    nodes = ['actor User as USER', 'component "Backend FastAPI" as API']
-    edges = ['USER --> API : HTTP(S) request']
-
-    if has("front", "react", "vite", "ui", "web"):
-        nodes.append('component "Frontend (React/Vite)" as FE')
-        edges += ['USER --> FE : Browser', 'FE --> API : REST/JSON']
-
-    if has("gateway", "nginx", "ingress", "api gateway"):
-        nodes.append('component "API Gateway" as GATE')
-        edges += ['FE --> GATE', 'GATE --> API']
-
-    if has("auth", "oauth", "jwt", "keycloak"):
-        nodes.append('component "Auth Service" as AUTH')
-        edges.append('API --> AUTH : validate token')
-
-    if has("db", "database", "postgres", "mysql", "mongodb"):
-        nodes.append('database "DB" as DB')
-        edges.append('API --> DB : SQL/NoSQL')
-
-    if has("cache", "redis"):
-        nodes.append('component "Cache (Redis)" as CACHE')
-        edges.append('API --> CACHE')
-
-    if has("queue", "broker", "kafka", "rabbit"):
-        nodes.append('component "Message Broker" as MQ')
-        edges.append('API --> MQ : events')
-
-    if has("rag", "vector", "embedding", "chroma", "pdf"):
-        nodes.append('component "Vector Store (Chroma)" as VS')
-        nodes.append('component "Docs Storage (PDFs)" as DOCS')
-        edges += ['API --> VS : search', 'API --> DOCS : load']
-
-    if has("llm", "openai", "azure openai", "model"):
-        nodes.append('component "LLM Provider" as LLM')
-        edges.append('API --> LLM : inference')
-
-    if has("kroki", "plantuml", "c4"):
-        nodes.append('component "Kroki" as KROKI')
-        edges.append('API --> KROKI : render diagram')
-
-    if len(nodes) <= 2:
-        nodes += ['database "DB" as DB', 'component "Kroki" as KROKI']
-        edges += ['API --> DB', 'API --> KROKI']
-
-    body = "\n".join(nodes + [""] + edges)
-    title = (title_hint or "Component Diagram").strip()[:60]
-    return "@startuml\n!pragma teoz true\n" + f"title {title}\n\n{body}\n@enduml\n"
 
 # ===================== Health ===========================
 @app.get("/")
@@ -520,63 +464,45 @@ async def message(
         arch_flow["tactics"] = tactics_json or []
         arch_flow["stage"] = "TACTICS"
 
-    # ===================== DIAGRAMA =====================
-    diagram_obj = result.get("diagram") or {}
-    new_b64 = (diagram_obj.get("svg_b64") or "").strip()
-    prev_b64 = memory_get(user_id, "last_svg_b64", "").strip()
+        # ===================== DIAGRAMA =====================
+    # Ya no generamos SVG/PNG ni usamos Kroki.
+    # Solo devolvemos el script de Mermaid que construye el grafo con ASR + estilo + tácticas.
+    diagram_obj = {}
 
-    wants_that_asr_diagram = _wants_diagram_of_that_asr(message)
-
-    if wants_that_asr_diagram:
-        current_asr = memory_get(user_id, "current_asr", "")
-        combo_text = (f"{message}\n\n{current_asr}").strip()
-        puml = _build_component_puml_from_text(combo_text, title_hint=f"ASR Diagram [{message_id}]")
-        ok, payload, err = render_kroki_sync("plantuml", puml, output_format="svg")
-        if ok and payload:
-            svg_b64 = base64.b64encode(payload).decode("ascii")
-            diagram_obj = {
-                "ok": True,
-                "diagram_type": "plantuml",
-                "format": "svg",
-                "svg_b64": svg_b64,
-                "data_uri": f"data:image/svg+xml;base64,{svg_b64}",
-                "message": None,
-                "source_echo": puml,
-            }
-            new_b64 = svg_b64
-        else:
-            diagram_obj = {
-                "ok": False,
-                "diagram_type": "plantuml",
-                "format": "svg",
-                "svg_b64": None,
-                "data_uri": None,
-                "message": err or "Kroki render error (fallback)",
-                "source_echo": puml,
-            }
-            new_b64 = ""
-
-    # Guarda el último solo si hay algo nuevo
-    if new_b64:
-        memory_set(user_id, "last_svg_b64", new_b64)
-
-    # Persistimos diagrama de despliegue si llegó
-    if diagram_obj and diagram_obj.get("svg_b64"):
-        arch_flow["deployment_diagram_puml"] = diagram_obj.get("source_echo", "")
-        arch_flow["deployment_diagram_svg_b64"] = diagram_obj.get("svg_b64", "")
-
-    # Solo marcamos DEPLOYMENT si el usuario pidió despliegue explícitamente
+    # Si el usuario pidió explícitamente un diagrama de despliegue, marcamos el stage
     if _wants_deployment(message):
         arch_flow["stage"] = "DEPLOYMENT"
 
-    # Persistimos el estado ADD 3.0 actualizado
+    # Persistimos el flujo ADD 3.0 actualizado (ASR, estilo, tácticas, stage, etc.)
     save_arch_flow(user_id, arch_flow)
+
+    # Mermaid generado por el grafo (diagram_orchestrator_node)
+        # Mermaid generado por el grafo (diagram_orchestrator_node)
+    mermaid_code = (result.get("mermaidCode") or "").strip()
+
+    # Siempre que tengamos Mermaid, pegamos el bloque ```mermaid``` al final.
+    # (Da igual si el intent que vimos era "diagram" o no.)
+    if mermaid_code:
+        mermaid_help = (
+            "\n\n---\n"
+            "Here is the **Mermaid script** for this diagram.\n"
+            "You can copy & paste it into the Mermaid live editor (https://mermaid.live), "
+            "a VS Code Mermaid plugin, or any compatible renderer:\n\n"
+            "```mermaid\n"
+            f"{mermaid_code}\n"
+            "```"
+        )
+        end_msg = (end_msg + mermaid_help).strip()
+
+    else:
+        # Aseguramos que end_msg esté definido
+        end_msg = end_msg.strip()
 
     # --- Payload al front (no pisamos suggestions si las necesitas) ---
     clean_payload = {
         "endMessage": end_msg,
-        "mermaidCode": result.get("mermaidCode", ""),
-        "diagram": diagram_obj,                # usa diagram.data_uri o svg_b64 en el front
+        "mermaidCode": mermaid_code,
+        "diagram": diagram_obj,  # ahora siempre vacío; ya no mandamos SVG
         "messages": result.get("turn_messages", []),
         "session_id": session_id,
         "message_id": message_id,
@@ -585,6 +511,21 @@ async def message(
     }
 
     return clean_payload
+
+    # --- Payload al front (no pisamos suggestions si las necesitas) ---
+    clean_payload = {
+        "endMessage": end_msg,
+        "mermaidCode": mermaid_code,
+        "diagram": diagram_obj,                # ahora puede venir vacío si user_intent == "diagram"
+        "messages": result.get("turn_messages", []),
+        "session_id": session_id,
+        "message_id": message_id,
+        "thread_id": thread_id,
+        "suggestions": result.get("suggestions", []),
+    }
+
+    return clean_payload
+
 
 # ===================== /feedback ========================
 @app.post("/feedback")

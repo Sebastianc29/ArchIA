@@ -245,19 +245,381 @@ TACTICS_JSON_EXAMPLE = """[
 
 # ========== PlantUML helper (LLM)
 
-PLANTUML_SYSTEM = """You are an expert software architect and PlantUML author.
-Convert the user's natural-language request into a PlantUML DEPLOYMENT diagram.
+PLANTUML_SYSTEM = """
+You are an expert software architect and PlantUML author.
 
-HARD RULES:
-- Output ONLY PlantUML between @startuml and @enduml (no prose, no code fences).
-- ASCII only (no « », →, ↔, …). Use <<stereotypes>> and -> arrows.
-- Prefer compact structure: cloud "Internet", node "k8s cluster" as cluster, package "namespace" { ... }.
-- Use 'database' for DBs, 'queue' for brokers if needed, 'folder' for volumes.
-- Prefer relationships even if the user didn't specify them explicitly (infer reasonable ones):
-  Ingress -> Services; Services -> Deployments/Pods; Deployments -> DB/Cache; Workers -> DB/Cache/Queues.
-- Annotate ports and replicas in labels when provided (e.g., "api (8000) replicas=3").
-- Keep output readable.
+The HUMAN message you receive is NOT just a short request: it is a multi-section prompt
+with (approximately) this structure:
+
+Business / project context:
+<text>
+
+Quality Attribute Scenario (ASR):
+<full ASR in natural language>
+
+Chosen architecture style:
+<short style name>
+
+Selected tactics:
+- <tactic 1 name>
+- <tactic 2 name>
+- ...
+
+User diagram request:
+<short instruction, e.g. "Generate a deployment diagram aligned with these tactics.">
+
+Your job is to TRANSFORM the ASR + style + tactics into a concrete architecture diagram,
+NOT to draw the user sentence itself.
+
+HARD RULES
+- Output ONLY PlantUML between @startuml and @enduml (no prose, no fences).
+- Use only ASCII (no arrows like →, etc.). Use <<stereotypes>> and -> arrows.
+- Never create a component/node whose label is the text of the user request
+  (e.g., "Generate a deployment diagram aligned with these tactics").
+- The ASR artifact and response must drive the structure:
+  - external client(s) / Internet
+  - entrypoint (API gateway, web app, mobile app, etc.) that receives the stimulus
+  - internal services/components that implement the tactics (e.g., cache, autoscaler,
+    circuit breaker, message broker, DB, read replicas, CDN, etc.)
+  - data stores, queues and monitoring components.
+
+- If the user asks for a *deployment* diagram, model nodes (cloud/region, k8s cluster,
+  hosts/VMs, databases, queues) and how components are deployed on them.
+- If the user asks for a *component* diagram, focus on logical components and their
+  connectors (no need to show physical nodes).
+
+- Infer reasonable components and relationships from the ASR + style + tactics:
+  - tie each tactic to at least one component or connector
+    (e.g., "Elastic Horizontal Scaling" -> autoscaled API service,
+           "Cache-Aside + TTL" -> cache in front of DB,
+           "Circuit Breaker" -> proxy around downstream dependency).
+  - make sure the diagram shows how the Response Measure in the ASR can be achieved
+    (latency, throughput, availability, etc.).
+
+- Prefer a compact but meaningful structure:
+  - cloud "Internet" as entry.
+  - node "k8s cluster" or "Cloud region" for infra.
+  - inside, components/services, databases, queues, caches.
+
+- Add arrows (->) between components to show data/control flow.
+- Make the diagram readable and not overcrowded.
 """
+
+MERMAID_SYSTEM = """
+You are an expert software architect and Mermaid diagram author.
+
+The HUMAN message you receive is NOT just a short request: it is a multi-section prompt
+with (approximately) this structure:
+
+Business / project context:
+<text>
+
+Quality Attribute Scenario (ASR):
+<full ASR in natural language>
+
+Chosen architecture style:
+<short style name>
+
+Selected tactics:
+- <tactic 1 name>
+- <tactic 2 name>
+- ...
+
+User diagram request:
+<short instruction, e.g. "Generate a deployment diagram aligned with these tactics.">
+
+Your job is to TRANSFORM the ASR + style + tactics into a concrete architecture diagram,
+NOT to draw the user sentence itself.
+
+IMPORTANT: The tactics and style you show in the diagram MUST come from the human prompt
+(the ASR + style + selected tactics). Do NOT hard-code or always repeat the same tactics.
+Use whatever tactics and style the upstream steps selected for this ASR.
+
+===========================================================
+HARD OUTPUT RULES (STRICT MERMAID SAFETY)
+===========================================================
+
+1. The FIRST line of output MUST ALWAYS be:
+     graph LR
+   Never place anything before it. Never omit it.
+
+2. ALL Mermaid node IDs MUST match this regex:
+     ^[a-zA-Z_][a-zA-Z0-9_]*$
+   - No spaces, no hyphens, no dots, no trailing underscores.
+   - Node IDs must be short and readable (api, cache, cb_proxy, edge_fn).
+
+3. EVERY node MUST be declared BEFORE being used in an edge.
+   Forbidden:
+     api --> db["Database"]
+   Required:
+     db["Database"]
+     api --> db
+
+4. Node definitions MUST be on their own line.
+   Forbidden inline definitions:
+     api --> cb["Circuit Breaker"]
+   Required:
+     cb["Circuit Breaker"]
+     api --> cb
+
+5. ALL edges MUST follow EXACT Mermaid syntax:
+     A --> B
+     A --- B
+
+   CRITICAL: In this system you MUST NOT use edge labels at all.
+   That means:
+     - Do NOT use: A --|label| B
+     - Do NOT use: A -- text --> B
+   Only unlabeled edges are allowed:
+     - A --> B
+     - A --- B
+
+6. NO line may start with symbols or stray characters:
+   Forbidden prefixes: "…", "|", ")", "}", "]", "_", "-", "•"
+   Every line must begin with either:
+     - nodeId
+     - subgraph
+     - end
+     - whitespace + nodeId
+
+7. ABSOLUTELY FORBIDDEN PATTERNS:
+   - Inline nodes in edges
+   - Two IDs glued together (e.g., clientcdn_cache, origin_inferenceedge_cb)
+   - Incomplete IDs (edge_, cache__, _api)
+   - Any label or ID that causes token merging
+   - Edge labels with \\n or multi-line text
+   - Unicode arrows or strange characters inside labels
+   - Targeting quoted strings directly as edge endpoints
+   - Creating tactic nodes inline in edges
+   - Using reserved characters: `;`, `:`, `{}`, `[]` inside IDs
+
+8. NEVER wrap the output in ``` fences.
+   Output ONLY the Mermaid code.
+
+===========================================================
+SEMANTIC RULES (FROM YOUR ORIGINAL SYSTEM)
+===========================================================
+
+- The ASR artifact and response must drive the structure:
+  external clients, entrypoints, internal services,
+  caches, autoscaling, fallback, replication, DB, queues, monitoring.
+
+- For deployment diagrams: use subgraphs for regions/clusters/hosts.
+- For component diagrams: logical components only.
+
+- Infer components from ASR + style + tactics.
+- Tie tactics to components (cache, autoscaler, circuit breaker, etc.)
+
+- Use short node IDs with readable labels:
+     api["Checkout API"]
+     cache["Redis Cache"]
+     db[("Orders DB")]
+
+- One Mermaid statement per line:
+     node definition
+     edge
+     subgraph
+     end
+
+- Subgraphs MUST follow this pattern:
+     subgraph REGION["Title"]
+       node1["..."]
+       node2["..."]
+     end
+
+===========================================================
+TRACEABILITY / TACTICS (if applicable)
+===========================================================
+
+When you want to show which components implement which tactics,
+use nodes for the tactics and connect components with unlabeled edges.
+
+Example ONLY (you must adapt names to the REAL tactics from the prompt):
+     tactic_cache["Tactic: Cache-Aside + TTL"]
+     edge_cache --- tactic_cache
+     precompute --- tactic_cache
+
+     tactic_cb["Tactic: Circuit Breaker + Fallback"]
+     cb_proxy --- tactic_cb
+
+     tactic_scale["Tactic: Elastic Scaling"]
+     autoscaler --- tactic_scale
+
+These are just examples of structure. The actual tactic names and
+number of tactics MUST come from the selected tactics in the human prompt.
+
+===========================================================
+EXTRA SAFETY RULES TO PREVENT MERMAID LEXICAL ERRORS
+===========================================================
+
+- Never produce labels containing slashes "/", commas ",", parentheses "( )",
+  or long natural-language sentences. In fact, for this system you must NOT
+  produce any edge labels at all; edges are plain arrows.
+
+- Never let a line end with a node ID immediately followed by the next ID on
+  the next line without a newline between them. This can cause Mermaid to merge
+  IDs such as:
+      cdn_edge
+      edge_fn
+  into the invalid token:
+      cdn_edgeedge_fn
+
+- To prevent this: the model SHOULD place a real blank line (an empty line with
+  no spaces) between logically separate blocks (e.g., between different groups
+  of edges or after subgraph blocks). However, a single newline between
+  statements is still valid Mermaid. Do NOT put multiple statements on one line.
+
+- Never place two edges or two node declarations on the same line.
+
+- Do not generate ANY invisible characters, Unicode spaces, or hidden characters
+  between IDs and arrows.
+
+===========================================================
+REMINDERS
+===========================================================
+
+- You are transforming ASR + style + tactics into a concrete architecture diagram.
+- The chosen style and the selected tactics MUST be visible in the structure:
+  components that embody those tactics, data paths that support the ASR metrics
+  (latency, availability, throughput, degradation, etc.).
+- Follow ALL rules above strictly so that the output parses correctly in Mermaid 11.x.
+
+"""
+
+
+def _sanitize_mermaid(code: str) -> str:
+    if not code:
+        return ""
+
+    code = code.replace("\r\n", "\n")
+
+    # Recortar cualquier texto antes del primer "graph" o "flowchart"
+    m = re.search(r"(graph\s+(?:LR|TD|BT|RL)[\s\S]*$)", code, flags=re.IGNORECASE)
+    if not m:
+        m = re.search(r"(flowchart[\s\S]*$)", code, flags=re.IGNORECASE)
+    if m:
+        code = m.group(1)
+    else:
+        # Si NO hay 'graph' ni 'flowchart', asumimos que son solo nodos/edges
+        # y les anteponemos una cabecera por defecto.
+        stripped = code.lstrip()
+        if not stripped.lower().startswith(("graph ", "flowchart ")):
+            code = "graph LR\n" + code
+
+    # Reemplazar secuencias literales "\n" por espacios
+    code = code.replace(r"\n", " ")
+
+    # Normalizar algunos caracteres unicode problemáticos
+    replacements = {
+        "≤": "<=",
+        "≥": ">=",
+        "→": "->",
+        "⇒": "->",
+        "↔": "<->",
+        "—": "-",
+        "–": "-",
+        "\u00A0": " ",
+        "“": '"',
+        "”": '"',
+        "’": "'",
+    }
+    for bad, good in replacements.items():
+        code = code.replace(bad, good)
+
+    lines = code.split("\n")
+    new_nodes: list[str] = []
+
+    # 1) Patrones del tipo:  edge_cache ---|implements| "texto"
+    edge_to_string = re.compile(
+        r"^(\s*"               # indent + source id
+        r"[A-Za-z_]\w*"        # id origen
+        r"\s*)"
+        r"(-{1,3}<?(?:>|)?)"   # operador de arista: --, -->, --- etc.
+        r"\s*\|([^|]+)\|\s*"   # label
+        r'"([^"]+)"\s*$'       # "texto" como destino
+    )
+
+    # 2) Patrones del tipo:  edge_cache --|MISS| cb["Circuit Breaker Proxy"]
+    edge_with_inline_node = re.compile(
+        r"^(\s*"               # indent + source id
+        r"[A-Za-z_]\w*"
+        r"\s*)"
+        r"(-{1,3}<?(?:>|)?)"   # operador
+        r"\s*\|([^|]+)\|\s*"   # label
+        r"([A-Za-z_]\w*)\["    # id de nodo destino
+        r"\"([^\"]+)\"\]\s*$"  # "texto" dentro del nodo
+    )
+
+    # Conjunto de nodos ya definidos (para no duplicar)
+    defined_nodes = set()
+    for line in lines:
+        m_node = re.match(r"\s*([A-Za-z_]\w*)\s*\[", line)
+        if m_node:
+            defined_nodes.add(m_node.group(1))
+
+    tactic_idx = 1
+
+    for i, line in enumerate(lines):
+        # Caso 1:  A ---|label| "texto"
+        m1 = edge_to_string.match(line)
+        if m1:
+            indent, op, label, text = m1.groups()
+            base_id = re.sub(r"\W+", "_", label.strip().lower()) or "note"
+            node_id = f"tactic_{base_id}_{tactic_idx}"
+            tactic_idx += 1
+
+            # Definimos el nodo nuevo (nota/táctica)
+            new_nodes.append(f'  {node_id}["{text}"]')
+            defined_nodes.add(node_id)
+
+            # Reemplazamos la línea original para que apunte al nodo
+            lines[i] = f"{indent}{op} |{label.strip()}| {node_id}"
+            continue
+
+        # Caso 2:  A --|label| B["texto"]
+        m2 = edge_with_inline_node.match(line)
+        if m2:
+            indent, op, label, node_id, text = m2.groups()
+
+            # Reemplazamos la línea por edge hacia el id del nodo
+            lines[i] = f"{indent}{op} |{label.strip()}| {node_id}"
+
+            # Añadimos la definición del nodo si aún no existe
+            if node_id not in defined_nodes:
+                new_nodes.append(f'  {node_id}["{text}"]')
+                defined_nodes.add(node_id)
+            continue
+
+    if new_nodes:
+        lines.append("")
+        lines.append("  %% Auto-generated tactic/note nodes")
+        lines.extend(new_nodes)
+
+    return "\n".join(lines).strip()
+
+
+def _llm_nl_to_mermaid(natural_prompt: str) -> str:
+    """
+    Llama al LLM para obtener código Mermaid puro (sin fences) y lo sanea
+    con _sanitize_mermaid antes de devolverlo.
+    """
+    msgs = [SystemMessage(content=MERMAID_SYSTEM),
+            HumanMessage(content=natural_prompt)]
+    resp = llm.invoke(msgs)
+    raw = getattr(resp, "content", str(resp)) or ""
+
+    # Si vino con ```mermaid ...```, usamos solo el cuerpo
+    m = re.search(r"```mermaid\s*(.*?)```", raw, flags=re.I | re.S)
+    if m:
+        return _sanitize_mermaid(m.group(1))
+
+    # Si vino con ```algo ...```, también usamos solo el cuerpo
+    m = re.search(r"```(?:\w+)?\s*(.*?)```", raw, flags=re.I | re.S)
+    if m:
+        return _sanitize_mermaid(m.group(1))
+
+    # Si no hay fences, saneamos todo el texto
+    return _sanitize_mermaid(raw)
 
 _UNICODE_FIXES = [
     (r"```+plantuml|```+puml|```+", ""),
@@ -289,48 +651,54 @@ def _llm_nl_to_puml(natural_prompt: str) -> str:
     return _sanitize_puml(raw)
 
 # ========== Backends de render
-
 def _render_nl_with_backend(uq: str, fmt: str = DIAGRAM_FORMAT) -> dict:
-    url = f"{DIAGRAM_BASE}/diagram/nl"
-    try:
-        r = _HTTP.post(url, json={"prompt": uq, "output_format": fmt}, timeout=(5, 180))
-        if r.status_code == 200:
-            b64 = base64.b64encode(r.content).decode("ascii")
-            ctype = r.headers.get("content-type", "image/svg+xml")
-            return {"ok": True, "svg_b64": b64, "content_type": ctype}
-        return {"ok": False, "error": f"{r.status_code}: {r.text[:200]}"}
-    except requests.Timeout as e:
-        return {"ok": False, "error": f"NL backend timeout: {e}"}
-    except Exception as e:
-        return {"ok": False, "error": f"NL backend error: {e}"}
+    """
+    NL backend deshabilitado en esta instalación.
+    Siempre devolvemos error para que el orquestador use LLM -> PlantUML -> Kroki.
+    """
+    return {"ok": False, "error": "NL backend disabled in this setup"}
 
 def _render_puml_with_backend(puml: str, fmt: str = DIAGRAM_FORMAT) -> dict:
-    url = f"{DIAGRAM_BASE}/diagram/render"
-    payload = {"diagram_type": "plantuml", "source": puml, "output_format": fmt}
+    """
+    Renderiza PlantUML usando Kroki directamente, sin depender de un microservicio /diagram/render.
+    """
     try:
-        r = _HTTP.post(url, json=payload, timeout=(5, 180))
-        if r.status_code == 200:
-            b64 = base64.b64encode(r.content).decode("ascii")
-            ctype = r.headers.get("content-type", "image/svg+xml")
-            return {"ok": True, "svg_b64": b64, "content_type": ctype}
-        return {"ok": False, "error": f"{r.status_code}: {r.text[:200]}"}
-    except requests.Timeout as e:
-        return {"ok": False, "error": f"Render backend timeout: {e}"}
+        from src.clients.kroki_client import render_kroki_sync
+        out_fmt = fmt or "svg"
+        ok, payload, err = render_kroki_sync("plantuml", puml, out_fmt)
+        if ok and payload:
+            # payload ya viene en bytes desde Kroki
+            b64 = base64.b64encode(payload).decode("ascii")
+            return {
+                "ok": True,
+                "svg_b64": b64,
+                "content_type": "image/svg+xml" if out_fmt == "svg" else "application/octet-stream",
+            }
+        return {"ok": False, "error": err or "Kroki render failed"}
     except Exception as e:
-        return {"ok": False, "error": f"Render backend error: {e}"}
-
-# In-proc (opcional)
+        return {"ok": False, "error": f"Kroki render error: {e}"}
 def _render_inproc_puml(puml: str, fmt: str = DIAGRAM_FORMAT) -> dict:
-    """Render en-proceso si tienes un cliente local disponible (evita HTTP loopback)."""
+    """Render en-proceso usando plantuml_local (binario local o JAR)."""
     if not DIAGRAM_INPROC:
         return {"ok": False, "error": "in-proc disabled"}
     try:
-        # Si tienes un cliente local para Kroki/PlantUML, con esta interfaz:
-        # from src.clients.kroki_client import render_plantuml
-        from src.clients.kroki_client import render_plantuml  # type: ignore
-        svg_bytes = render_plantuml(puml, fmt=fmt)  # debe devolver bytes
+        from src.clients.plantuml_local import render_plantuml_local
+        ok, payload, err = render_plantuml_local(puml, out=fmt or "svg")
+        if not ok or not payload:
+            return {"ok": False, "error": err or "PlantUML local error"}
+
+        # Normalizamos a bytes para luego base64
+        if isinstance(payload, str):
+            svg_bytes = payload.encode("utf-8")
+        else:
+            svg_bytes = payload
+
         b64 = base64.b64encode(svg_bytes).decode("ascii")
-        return {"ok": True, "svg_b64": b64, "content_type": "image/svg+xml"}
+        return {
+            "ok": True,
+            "svg_b64": b64,
+            "content_type": "image/svg+xml" if (fmt or "svg") == "svg" else "application/octet-stream",
+        }
     except Exception as e:
         return {"ok": False, "error": f"in-proc render error: {e}"}
 
@@ -715,8 +1083,17 @@ def analyze_tool(image_path: str, image_path2: str) -> str:
 def router(state: GraphState) -> Literal["investigator","creator","evaluator","diagram_agent","tactics","asr","style","unifier"]:
     if state["nextNode"] == "unifier":
         return "unifier"
-    elif state["nextNode"] == "asr" and not state.get("hasVisitedASR", False):
+
+    # NEW: para peticiones de ASR con RAG, pasa primero por el investigador
+    if state["nextNode"] == "asr" and not state.get("hasVisitedASR", False):
+        if (
+            not state.get("hasVisitedInvestigator", False)
+            and not state.get("doc_only", False)
+            and state.get("force_rag", False)
+        ):
+            return "investigator"
         return "asr"
+
     if state["nextNode"] == "style":
         return "style"
     elif state["nextNode"] == "tactics":
@@ -733,67 +1110,106 @@ def router(state: GraphState) -> Literal["investigator","creator","evaluator","d
         return "unifier"
 
 # ========== Nodo: Orquestador de diagramas (NL → render / LLM→PUML→render) ==========
-
-def diagram_orchestrator_node(state: "GraphState") -> "GraphState":
+def diagram_orchestrator_node(state: GraphState) -> GraphState:
     """
-    Orquesta: NL parser del backend  y/o LLM->PlantUML->render.
-    - DIAGRAM_NL_MODE=off:       solo backend /diagram/nl
-    - DIAGRAM_NL_MODE=always:    siempre LLM -> /diagram/render (fallback a /nl si falta flechas)
-    - DIAGRAM_NL_MODE=fallback:  intenta /nl; si falla, usa LLM -> /render (y como 3er fallback, in-proc si existe)
+    Nodo orquestador de diagramas:
+    - Usa el ASR + estilo + tácticas + contexto + memoria del grafo
+    - Genera SOLO el script Mermaid (state["mermaidCode"])
+    - NO llama a Kroki, ni a /diagram/nl, ni genera SVG/PNG
     """
-    uq = state.get("localQuestion") or state.get("userQuestion") or ""
-    mode = DIAGRAM_NL_MODE
+    # Pregunta actual del usuario (si existe)
+    user_q = (state.get("localQuestion") or state.get("userQuestion") or "").strip()
 
-    def _ok(res: dict) -> bool:
-        return bool(res and res.get("ok") and res.get("svg_b64"))
+    # --- ASR ---
+    asr_text = (
+        state.get("current_asr")
+        or state.get("last_asr")
+        or ""
+    ).strip()
 
-    # 1) Modo off → solo NL backend
-    if mode == "off":
-        res = _render_nl_with_backend(uq)
-        state["diagram"] = res
-        state["hasVisitedDiagram"] = True
-        return state
+    # --- Estilo arquitectónico ---
+    style_text = (
+        state.get("style")
+        or state.get("selected_style")
+        or state.get("last_style")
+        or ""
+    ).strip()
 
-    # 2) Modo always → LLM→PUML→render (fallback a NL y/o in-proc)
-    if mode == "always":
-        try:
-            puml = _llm_nl_to_puml(uq)
-            if ("->" not in puml) and ("-->" not in puml):
-                res = _render_nl_with_backend(uq)
-                if not _ok(res) and DIAGRAM_INPROC:
-                    res = _render_inproc_puml(puml)
-            else:
-                res = _render_puml_with_backend(puml)
-                if not _ok(res) and DIAGRAM_INPROC:
-                    res = _render_inproc_puml(puml)
-                if not _ok(res):
-                    res2 = _render_nl_with_backend(uq)
-                    if _ok(res2): res = res2
-        except Exception as e:
-            log.warning("LLM->PUML failed: %s", e)
-            res = _render_nl_with_backend(uq)
-        state["diagram"] = res
-        state["hasVisitedDiagram"] = True
-        return state
+    # --- Tácticas: preferimos la estructura JSON; si no, el markdown ---
+    tactics_names: list[str] = []
 
-    # 3) Modo fallback (recomendado)
-    nl = _render_nl_with_backend(uq)
-    if _ok(nl):
-        state["diagram"] = nl
-        state["hasVisitedDiagram"] = True
-        return state
+    tactics_struct = state.get("tactics_struct") or []
+    if isinstance(tactics_struct, list):
+        for it in tactics_struct:
+            if isinstance(it, dict) and it.get("name"):
+                tactics_names.append(str(it["name"]))
 
-    # NL falló → LLM→PUML
+    if not tactics_names:
+        tactics_md = (state.get("tactics_md") or "").strip()
+        if tactics_md:
+            for line in tactics_md.splitlines():
+                line = re.sub(r"^\s*[-*]\s*", "", line).strip()
+                if line:
+                    tactics_names.append(line)
+
+    # Limitar un poco para que el diagrama no explote
+    tactics_names = tactics_names[:8]
+
+    tactics_block = (
+        "\n".join(f"- {t}" for t in tactics_names)
+        if tactics_names
+        else "- (no explicit tactics selected yet)"
+    )
+
+    # --- Contexto / memoria adicional ---
+    add_context = (state.get("add_context") or "").strip()
+    doc_context = (state.get("doc_context") or "").strip()
+    memory_text = (state.get("memory_text") or "").strip()
+
+    sections: list[str] = []
+
+    if add_context:
+        sections.append(f"Business / project context:\n{add_context}")
+
+    if doc_context:
+        sections.append(f"Project documents context (RAG):\n{doc_context}")
+
+    if memory_text:
+        sections.append(f"Conversation memory (ASR/style/tactics decisions):\n{memory_text}")
+
+    sections.append(
+        "Quality Attribute Scenario (ASR):\n"
+        f"{asr_text or '(not explicitly defined; infer it from the context and user request)'}"
+    )
+
+    sections.append(
+        "Chosen architecture style:\n"
+        f"{style_text or '(not explicitly chosen; infer a reasonable style for the ASR).'}"
+    )
+
+    sections.append("Selected tactics:\n" + tactics_block)
+
+    sections.append(
+        "User diagram request:\n"
+        + (user_q or "Generate a deployment/component diagram aligned with the ASR and tactics.")
+    )
+
+    full_prompt = "\n\n---\n\n".join(sections)
+
+    # --- Llamar al LLM especializado en Mermaid ---
     try:
-        puml = _llm_nl_to_puml(uq)
-        res = _render_puml_with_backend(puml)
-        if not _ok(res) and DIAGRAM_INPROC:
-            res = _render_inproc_puml(puml)
+        mermaid_code = _llm_nl_to_mermaid(full_prompt)
     except Exception as e:
-        res = {"ok": False, "error": f"LLM/Render error: {e}"}
+        log.warning("diagram_orchestrator_node: Mermaid generation failed: %s", e)
+        mermaid_code = ""
 
-    state["diagram"] = res
+    state["mermaidCode"] = mermaid_code or ""
+    # Ya no usamos imágenes ni backend de figuras
+    state["diagram"] = {}
     state["hasVisitedDiagram"] = True
+    # Opcional: marcar intención de diagrama por si algo más lo usa
+    state["intent"] = "diagram"
+
     return state
 
 # ========== Nodos principales ==========
@@ -1581,12 +1997,24 @@ def researcher_node(state: GraphState) -> GraphState:
     msgs_out = result.get("messages", [])
     for m in msgs_out:
         _push_turn(state, role="assistant", name="researcher", content=str(getattr(m, "content", m)))
+        # NEW: usar la última respuesta del investigador como contexto de negocio/técnico
+    if msgs_out:
+        last_msg = msgs_out[-1]
+        last_text = getattr(last_msg, "content", str(last_msg)) or ""
+        # Lo recortamos para no romper el prompt de los siguientes nodos
+        state["add_context"] = _clip_text(str(last_text).strip(), 2000)
 
-    return {
+        return {
         **state,
-        "messages": state["messages"] + [AIMessage(content=getattr(m, "content", str(m)), name="researcher") for m in msgs_out],
+        "messages": state["messages"] + [
+            AIMessage(
+                content=str(getattr(m, "content", m)),
+                name="researcher"
+            ) for m in msgs_out
+        ],
         "hasVisitedInvestigator": True
     }
+
 
 
 def creator_node(state: GraphState) -> GraphState:
@@ -1807,7 +2235,69 @@ def unifier_node(state: GraphState) -> GraphState:
     lang = state.get("language", "es")
     intent = state.get("intent", "general")
 
-    # 0) Mostrar el diagrama si existe (intención "diagram")
+    # 🟣 NUEVO: caso especial cuando ya tenemos un script Mermaid de diagrama
+    mermaid = (state.get("mermaidCode") or "").strip()
+    if mermaid:
+        if lang == "es":
+            head = (
+                "Aquí tienes el diagrama solicitado, generado a partir de tu "
+                "escenario de calidad (ASR), el estilo arquitectónico seleccionado "
+                "y las tácticas priorizadas.\n\n"
+                "Puedes copiar y pegar este script Mermaid en tu editor preferido "
+                "(por ejemplo, mermaid.live o un plugin de VS Code):\n"
+            )
+            footer = ""
+            suggestions = [
+                "Formular un nuevo ASR para otro escenario de calidad.",
+                "Generar un diagrama de componentes a partir de este sistema.",
+                "Generar un diagrama de despliegue para este mismo sistema.",
+            ]
+        else:
+            head = (
+                "Here is the requested diagram, generated from your quality "
+                "scenario (ASR), the selected architectural style and the "
+                "prioritized tactics.\n\n"
+                "You can copy & paste this Mermaid script into your favorite "
+                "editor (for example, mermaid.live or a VS Code Mermaid plugin):\n"
+            )
+            footer = ""
+            suggestions = [
+                "Generate a new ASR for another quality scenario.",
+                "Generate a component diagram from this system.",
+                "Generate a deployment diagram for this same system.",
+            ]
+        
+        # Dentro del unifier, rama "if intent == 'diagram' and state.get('mermaidCode')"
+        mermaid = state.get("mermaidCode") or ""
+        if lang == "es":
+            head = "Aquí tienes el diagrama generado a partir del ASR, el estilo y las tácticas seleccionadas."
+            footer = ""
+            suggestions = [
+                "Formular un nuevo ASR para otro escenario de calidad.",
+                "Generar un diagrama de componentes a partir de este sistema.",
+                "Generar un diagrama de despliegue para este mismo sistema.",
+            ]
+        else:
+            head = (
+                "Here is the diagram generated from your quality scenario (ASR), "
+                "the selected architecture style and the prioritized tactics."
+            )
+            footer = ""
+            suggestions = [
+                "Generate a new ASR for another quality scenario.",
+                "Generate a component diagram from this system.",
+                "Generate a deployment diagram for this same system.",
+            ]
+
+        end_text = head  # 👈 ya NO incluimos el código mermaid en el texto
+
+        state["suggestions"] = suggestions
+        state["turn_messages"] = state.get("turn_messages", []) + [
+            {"role": "assistant", "name": "unifier", "content": end_text}
+        ]
+        return {**state, "endMessage": end_text, "intent": "diagram"}
+
+    # 0) Mostrar el diagrama si existe (intención "diagram") - LÓGICA ANTIGUA, LA MANTENEMOS
     d = state.get("diagram") or {}
     if d.get("ok") and d.get("svg_b64"):
         data_url = f'data:image/svg+xml;base64,{d["svg_b64"]}'

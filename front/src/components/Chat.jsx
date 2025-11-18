@@ -1,7 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import MermaidChart from "./MermaidChart";
 import {
   Box, Paper, List, ListItem, TextField, Button, Typography, Dialog,
   DialogTitle, DialogContent, ListItemText, IconButton, Badge, Chip, Stack,
@@ -89,74 +88,6 @@ const extractRagSources = (internal = []) => {
   }
   return out;
 };
-
-/* ========= helpers para SVG/PNG/PDF ========= */
-const toB64 = (s) => {
-  try { return btoa(unescape(encodeURIComponent(String(s)))); } catch { return ""; }
-};
-
-/** Devuelve un data-uri si encuentra:
- *  1) data:image/svg+xml;base64,....
- *  2) data:image/svg+xml;utf8,<svg ...>...</svg>
- *  3) un bloque <svg>...</svg> crudo en el texto
- */
-const extractSvgDataUrlFromText = (text = "") => {
-  const s = String(text || "");
-
-  // 1) data:image/svg+xml;base64,...
-  const mB64Full = s.match(/data:image\/svg\+xml;base64,[A-Za-z0-9+/=]+/);
-  if (mB64Full) return mB64Full[0];
-
-  // 2) data:image/svg+xml;utf8,<svg ...>...</svg>
-  const mUtf8 = s.match(/data:image\/svg\+xml;[^,]*,([\s\S]+?)["')\s]/);
-  if (mUtf8 && mUtf8[1] && mUtf8[1].includes("<svg")) {
-    const svg = decodeURIComponent(mUtf8[1]);
-    if (svg.includes("</svg>")) {
-      return `data:image/svg+xml;base64,${toB64(svg)}`;
-    }
-  }
-
-  // 3) bloque <svg>...</svg> crudo en el markdown
-  const i1 = s.indexOf("<svg");
-  const i2 = s.indexOf("</svg>");
-  if (i1 !== -1 && i2 !== -1 && i2 > i1) {
-    const svg = s.slice(i1, i2 + "</svg>".length);
-    return `data:image/svg+xml;base64,${toB64(svg)}`;
-  }
-
-  return null;
-};
-
-/* ========= Intento de diagrama NL ========= */
-const hasDiagramIntent = (t = "") =>
-  /\b(diagrama|diagram|plantuml|mermaid|despliegue|deployment)\b/i.test(t);
-
-async function renderDiagramFromNL(naturalPrompt, outputFormat = "svg") {
-  const res = await fetch(`${API}/diagram/nl`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt: naturalPrompt, output_format: outputFormat })
-  });
-
-  const ct = res.headers.get("content-type") || "";
-  if (!res.ok) {
-    const err = ct.includes("application/json") ? await res.json() : { detail: `HTTP ${res.status}` };
-    throw new Error(err.detail || "Render error");
-  }
-
-  if (ct.includes("image/svg")) {
-    const text = await res.text();
-    return { ok: true, data_uri: `data:image/svg+xml;base64,${toB64(text)}`, svg_text: text };
-  }
-  const blob = await res.blob();
-  if (ct.includes("image/png")) {
-    return { ok: true, data_uri: URL.createObjectURL(blob), kind: "png" };
-  }
-  if (ct.includes("application/pdf")) {
-    return { ok: true, data_uri: URL.createObjectURL(blob), kind: "pdf" };
-  }
-  return { ok: false, error: `Unsupported content-type: ${ct}` };
-}
 
 /* ======================= Assistant bubble (Markdown sin imágenes) ======================= */
 function AssistantMessage({ text, pending }) {
@@ -281,21 +212,11 @@ export default function Chat() {
     const seq = ++requestSeq.current;
     try {
       // 1) Llama al endpoint clásico de conversación
-      const resp = await fetch(`${API}/message`, { method: "POST", body: form });
+            const resp = await fetch(`${API}/message`, { method: "POST", body: form });
       const data = await resp.json();
       if (seq !== requestSeq.current) return;
 
       const textOut = data?.endMessage || "—";
-
-      // 2) Intento de render NL si el usuario pidió diagrama explícitamente
-      let diagram = null;
-      if (hasDiagramIntent(textToSend)) {
-        try {
-          diagram = await renderDiagramFromNL(textToSend, "svg");
-        } catch (e) {
-          console.warn("NL diagram render failed:", e);
-        }
-      }
 
       const rendered = optimistic.map((m) =>
         m.id === pendingId
@@ -307,13 +228,14 @@ export default function Chat() {
               mermaidCode: data?.mermaidCode || "",
               session_id: data?.session_id || sessionId,
               message_id: data?.message_id,
-              diagram: diagram || data?.diagram || null,
               suggestions: Array.isArray(data?.suggestions)
                 ? data.suggestions
                 : []
             }
           : m
       );
+
+
       setMessages(rendered);
       saveChat(sessionId, rendered);
     } catch (e) {
@@ -501,22 +423,6 @@ export default function Chat() {
           {messages.map((msg) => {
             const isUser = msg.sender === "usuario";
 
-            // === Resolución ROBUSTA del SVG ===
-            let diagramSrc = null;
-            if (!isUser) {
-              const d = msg?.diagram || {};
-              if (d && d.ok) {
-                if (d.data_uri) diagramSrc = d.data_uri;
-                else if (d.svg_b64) diagramSrc = `data:image/svg+xml;base64,${d.svg_b64}`;
-                else if (d.svg_text) diagramSrc = `data:image/svg+xml;base64,${toB64(d.svg_text)}`;
-              }
-              // Fallbacks a texto del asistente
-              if (!diagramSrc) {
-                const fromText = extractSvgDataUrlFromText(msg.text || "");
-                if (fromText) diagramSrc = fromText;
-              }
-            }
-
             // Limpieza de imágenes del markdown para evitar <img src=""> rotos
             const cleanedAssistantText = !isUser
               ? String(msg.text || "")
@@ -528,6 +434,29 @@ export default function Chat() {
             const roles = !isUser ? summarizeRoles(msg.internal_messages) : [];
             const ragSources = !isUser ? extractRagSources(msg.internal_messages) : [];
             const ratedKey = `${msg.session_id}-${msg.message_id}`;
+                        // Sugerencias que vamos a mostrar en la UI
+            const rawSuggestions = Array.isArray(msg.suggestions) ? msg.suggestions : [];
+
+            // Filtra labels internos tipo "unifier", "unifier_system"
+            const filteredSuggestions = rawSuggestions.filter(
+              (s) =>
+                typeof s === "string" &&
+                !/^[a-z0-9_]+$/i.test(s.trim()) // quita cosas sin espacios y con solo letras/números/guiones bajos
+            );
+
+            const lowerText = (msg.text || "").toLowerCase();
+            const isDiagramAnswer =
+              !isUser &&
+              (msg.diagram || msg.mermaidCode) &&
+              /diagram|diagrama/.test(lowerText);
+
+            const uiSuggestions = isDiagramAnswer
+              ? [
+                  "Generate a component diagram from this system.",
+                  "Generate a deployment diagram for this same system.",
+                  "Define a new ASR based on this system.",
+                ]
+              : filteredSuggestions;
 
             return (
               <ListItem key={msg.id} disableGutters sx={{ mb: 2 }}>
@@ -573,28 +502,7 @@ export default function Chat() {
                   )}
 
                   {/* Render del diagrama SVG si existe */}
-                  {!isUser && diagramSrc && (
-                    <Box sx={{ mt: 1.5 }}>
-                      <img
-                        src={diagramSrc}
-                        alt="diagram"
-                        style={{
-                          maxWidth: "100%",
-                          height: "auto",
-                          border: "1px solid rgba(255,255,255,0.12)",
-                          borderRadius: 8,
-                          background: "#fff"
-                        }}
-                      />
-                    </Box>
-                  )}
-
-                  {msg.mermaidCode && (
-                    <Box sx={{ mt: 2 }}>
-                      <MermaidChart chart={msg.mermaidCode} />
-                    </Box>
-                  )}
-
+      
                   {msg.images?.length > 0 && (
                     <Box className="image-container" sx={{ mt: 1 }}>
                       {msg.images.map((src, i) => (
@@ -603,11 +511,11 @@ export default function Chat() {
                     </Box>
                   )}
 
-                  {!isUser && Array.isArray(msg.suggestions) && msg.suggestions.length > 0 && (
+                  {!isUser && uiSuggestions.length > 0 && (
                     <>
                       <Divider sx={{ my: 1.2, opacity: 0.08 }} />
                       <Stack direction="row" spacing={1} sx={{ flexWrap: "wrap" }}>
-                        {msg.suggestions.map((s, i) => (
+                        {uiSuggestions.map((s, i) => (
                           <Chip
                             key={`${msg.id}-sugg-${i}`}
                             label={s}
@@ -618,7 +526,7 @@ export default function Chat() {
                               borderColor: "rgba(3,169,244,0.35)",
                               color: "#B3E5FC",
                               background: "rgba(3,169,244,0.10)",
-                              height: 26
+                              height: 26,
                             }}
                             variant="outlined"
                           />
@@ -626,6 +534,7 @@ export default function Chat() {
                       </Stack>
                     </>
                   )}
+
 
                   {!isUser && (roles.length > 0 || (msg.session_id && msg.message_id)) && (
                     <Divider sx={{ my: 1.2, opacity: 0.08 }} />
