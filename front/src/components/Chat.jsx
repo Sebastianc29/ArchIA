@@ -191,7 +191,8 @@ export default function Chat() {
       id: uuid(),
       sender: "usuario",
       text: textToSend,
-      images: attachedImages.map((img) => img.preview),
+      images: attachedImages.filter(img => !img.isPdf).map((img) => img.preview),
+      attachedFiles: attachedImages.map(img => ({ name: img.name, isPdf: img.isPdf, size: img.size })),
     };
     const pendingId = "pending-" + uuid();
     const pending = { id: pendingId, sender: "respuesta", text: "", pending: true };
@@ -267,9 +268,36 @@ export default function Chat() {
 
   const handleImageUpload = (e) => {
     if (isBusy) return;
-    const files = Array.from(e.target.files);
-    if (files.length + attachedImages.length > 2) { alert("Solo puedes adjuntar hasta 2 imágenes."); return; }
-    const picks = files.map((f) => ({ file: f, preview: URL.createObjectURL(f), name: f.name }));
+    const files = Array.from(e.target.files || []);
+    
+    if (!files || files.length === 0) return;
+    
+    // Simple: solo verifica cantidad
+    if (files.length + attachedImages.length > 2) { 
+      alert("Máximo 2 archivos"); 
+      return; 
+    }
+    
+    // Crear items
+    const picks = files.map((f) => {
+      const isPdf = (f.name || '').toLowerCase().endsWith('.pdf');
+      let preview = '';
+      
+      try {
+        preview = isPdf ? '📄 PDF' : URL.createObjectURL(f);
+      } catch {
+        preview = '📎 Archivo';
+      }
+      
+      return { 
+        file: f, 
+        preview, 
+        name: f.name,
+        isPdf,
+        size: (f.size / 1024 / 1024).toFixed(2)
+      };
+    });
+    
     setAttachedImages((p) => [...p, ...picks]);
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
@@ -511,6 +539,27 @@ export default function Chat() {
                     </Box>
                   )}
 
+                  {msg.attachedFiles?.length > 0 && (
+                    <Box sx={{ mt: 1 }}>
+                      {msg.attachedFiles.map((file, i) => (
+                        <Chip
+                          key={`${msg.id}-file-${i}`}
+                          icon={file.isPdf ? undefined : <ImageIcon />}
+                          label={`${file.isPdf ? '📄' : '🖼️'} ${file.name}${file.size ? ` (${file.size}MB)` : ''}`}
+                          size="small"
+                          sx={{ 
+                            mr: 1,
+                            mb: 0.5,
+                            background: file.isPdf ? "rgba(66,133,244,0.2)" : "rgba(103,58,183,0.2)",
+                            color: "white",
+                            borderColor: file.isPdf ? "rgba(66,133,244,0.5)" : "rgba(103,58,183,0.5)",
+                            border: "1px solid"
+                          }}
+                        />
+                      ))}
+                    </Box>
+                  )}
+
                   {!isUser && uiSuggestions.length > 0 && (
                     <>
                       <Divider sx={{ my: 1.2, opacity: 0.08 }} />
@@ -577,14 +626,20 @@ export default function Chat() {
       </Paper>
 
       {attachedImages.length > 0 && (
-        <Stack direction="row" spacing={1} sx={{ mt: 2, mb: 2, ml: 1 }}>
+        <Stack direction="row" spacing={1} sx={{ mt: 2, mb: 2, ml: 1, flexWrap: "wrap" }}>
           {attachedImages.map((img, index) => (
             <Chip
               key={`chip-${index}-${img.name}`}
-              icon={<ImageIcon />}
-              label={img.name.length > 18 ? img.name.substring(0, 16) + "…" : img.name}
+              icon={img.isPdf ? undefined : <ImageIcon />}
+              label={`${img.isPdf ? '📄' : '🖼️'} ${img.name.length > 15 ? img.name.substring(0, 12) + "…" : img.name}${img.size ? ` (${img.size}MB)` : ''}`}
               onDelete={() => removeImage(index)}
-              sx={{ maxWidth: 220, "& .MuiChip-label": { whiteSpace: "nowrap", color: "white" } }}
+              sx={{ 
+                maxWidth: 280, 
+                "& .MuiChip-label": { whiteSpace: "nowrap", color: "white" },
+                background: img.isPdf ? "rgba(66,133,244,0.15)" : "rgba(103,58,183,0.15)",
+                borderColor: img.isPdf ? "rgba(66,133,244,0.4)" : "rgba(103,58,183,0.4)",
+                border: "1px solid"
+              }}
             />
           ))}
         </Stack>
@@ -602,7 +657,12 @@ export default function Chat() {
           disabled={isBusy}
           InputProps={{
             endAdornment: (
-              <IconButton onClick={() => !isBusy && fileInputRef.current?.click()} disabled={attachedImages.length >= 2 || isBusy} sx={{ color: "#fff" }}>
+              <IconButton 
+                onClick={() => !isBusy && fileInputRef.current?.click()} 
+                disabled={attachedImages.length >= 2 || isBusy} 
+                sx={{ color: "#fff" }}
+                title="Adjunta imágenes (PNG, JPG, GIF, WebP) o PDFs - máx 2 archivos"
+              >
                 <Badge badgeContent={attachedImages.length} color="primary">
                   <AttachFileIcon />
                 </Badge>
@@ -611,7 +671,7 @@ export default function Chat() {
           }}
           sx={{ "& .MuiInputBase-root": { background: "#1d1d1d", color: "#fff", borderRadius: 1 } }}
         />
-        <input type="file" multiple accept="image/*" ref={fileInputRef} onChange={handleImageUpload} style={{ display: "none" }} />
+        <input type="file" multiple accept="image/*,.pdf" ref={fileInputRef} onChange={handleImageUpload} style={{ display: "none" }} />
         <Button className="send-button" variant="contained" onClick={() => sendMessage()} disabled={isBusy}>
           {isBusy ? "ENVIANDO..." : "ENVIAR"}
         </Button>
