@@ -1390,13 +1390,48 @@ def asr_node(state: GraphState) -> GraphState:
     doc_only = bool(state.get("doc_only"))
     ctx_doc = (state.get("doc_context") or "").strip()
 
-    # Heurística del atributo
-    concern = "scalability" if re.search(r"scalab", uq, re.I) else \
-              "latency"     if re.search(r"latenc", uq, re.I) else "performance"
+    # === DOC-ONLY MODE: Extraer contexto del documento ===
+    inferred_domain = None
+    inferred_concern = None
+    
+    if doc_only and ctx_doc:
+        doc_lower = ctx_doc.lower()
+        # Detectar dominio desde el documento
+        if any(k in doc_lower for k in ["ecommerce", "e-commerce", "commerce", "shop", "checkout", "cart"]):
+            inferred_domain = "e-commerce flash sale"
+        elif any(k in doc_lower for k in ["api", "rest", "graphql"]):
+            inferred_domain = "public REST API with burst traffic"
+        elif any(k in doc_lower for k in ["stream", "kafka", "event", "pub/sub"]):
+            inferred_domain = "event streaming pipeline"
+        elif any(k in doc_lower for k in ["microservice", "distributed", "service mesh"]):
+            inferred_domain = "microservices architecture"
+        elif any(k in doc_lower for k in ["data", "analytics", "reporting"]):
+            inferred_domain = "data analytics pipeline"
+        elif any(k in doc_lower for k in ["ml", "machine learning", "model"]):
+            inferred_domain = "ML inference serving"
+        
+        # Detectar atributo de calidad
+        if any(k in doc_lower for k in ["latencia", "latency", "response time", "delay"]):
+            inferred_concern = "latency"
+        elif any(k in doc_lower for k in ["escalabilidad", "scalability", "scale", "load"]):
+            inferred_concern = "scalability"
+        elif any(k in doc_lower for k in ["disponibilidad", "availability", "uptime", "failover"]):
+            inferred_concern = "availability"
+        elif any(k in doc_lower for k in ["throughput", "rps", "requests"]):
+            inferred_concern = "throughput"
+        elif any(k in doc_lower for k in ["seguridad", "security", "encrypt", "auth"]):
+            inferred_concern = "security"
+    
+    # Heurística del atributo (fallback)
+    concern = inferred_concern or \
+              ("scalability" if re.search(r"scalab", uq, re.I) else \
+               "latency"     if re.search(r"latenc", uq, re.I) else "performance")
 
     # Dominio típico si el usuario no lo da
     low = uq.lower()
-    if any(k in low for k in ["e-comm", "commerce", "shop", "checkout"]):
+    if inferred_domain:
+        domain = inferred_domain
+    elif any(k in low for k in ["e-comm", "commerce", "shop", "checkout"]):
         domain = "e-commerce flash sale"
     elif "api" in low:
         domain = "public REST API with burst traffic"
@@ -1421,6 +1456,15 @@ def asr_node(state: GraphState) -> GraphState:
     ctx = (ctx_doc if (doc_only and ctx_doc) else (state.get("add_context") or "")).strip()[:2000]
 
     # 💡 NUEVO FORMATO: ASR complete + secciones planas
+    doc_only_note = "" if not doc_only else """
+⚠️ SPECIAL CASE - Document-Only Mode:
+The user uploaded a document without additional instructions. You MUST analyze the provided document 
+deeply and infer the most important quality attribute scenario(s) from its content.
+- Extract key business requirements, technical constraints, and system characteristics
+- Identify the critical quality attribute (latency, scalability, availability, security, etc.)
+- Create an ASR that addresses the PRIMARY concern evident in the document
+"""
+
     prompt = f"""{directive}
 You are an expert software architect following Attribute-Driven Design 3.0 (ADD 3.0).
 
@@ -1432,19 +1476,21 @@ The scenario MUST:
 - Be measurable, with a clear Response Measure (SLO/SLA, e.g. p95 < X ms under Y load, error rate, availability, etc.).
 - Be realistic for production systems in the given domain.
 
+{doc_only_note}
+
 Relevant domain or workload (you must stay coherent with this):
 {domain}
 
-Quality attribute focus inferred from the user message:
+Quality attribute focus:
 {concern}
 
-User input to ground this ASR:
-{uq}
+{f"User input to ground this ASR:" if not doc_only else "Document Analysis - Ground the ASR in this context:"}
+{uq if uq.strip() else "(Document provided, analyze it to infer requirements)"}
 
-PROJECT CONTEXT (if any):
+PROJECT/DOCUMENT CONTEXT:
 {ctx or "None"}
 
-OPTIONAL BOOK CONTEXT (only if not in DOC-ONLY mode):
+OPTIONAL REFERENCE CONTEXT (architectural best practices):
 {book_snippets or "None"}
 
 OUTPUT FORMAT (MANDATORY – no bullets, no Markdown headings, no extra commentary):

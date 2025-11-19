@@ -167,6 +167,40 @@ def _extract_asr_from_result_text(text: str) -> str:
     if m: return m.group(1).strip()
     return ""
 
+def _generate_doc_only_suggestion(user_lang: str = "en") -> str:
+    """
+    Genera un mensaje sugerente cuando el usuario sube un documento sin escribir prompt.
+    Sugiere que se puede resolver con ADD 3.0 e invita a comenzar un ASR.
+    """
+    if user_lang == "es":
+        return (
+            "📄 **He detectado que subiste un documento sin escribir nada en el prompt.**\n\n"
+            "He analizado el contenido del documento. Ahora puedo ayudarte a:\n\n"
+            "✅ **Resolver esto con ADD 3.0** (Análisis, Decisiones y Diseño en 3 etapas)\n\n"
+            "¿Qué te gustaría hacer?\n\n"
+            "1️⃣ **Comenzar con un ASR** (Requisito Significativo de Arquitectura)\n"
+            "   - Basándome en el documento, podemos redactar un ASR que considere su contexto\n"
+            "   - Escribe algo como: *\"Crear ASR para [el tema del documento]\"*\n\n"
+            "2️⃣ **Hacerme una pregunta específica**\n"
+            "   - ¿Qué necesitas analizar o aclarar del documento?\n\n"
+            "3️⃣ **Analizar requisitos de calidad**\n"
+            "   - Latencia, escalabilidad, disponibilidad, rendimiento, etc.\n"
+        )
+    else:
+        return (
+            "📄 **I detected that you uploaded a document without writing anything in the prompt.**\n\n"
+            "I've analyzed the document content. Now I can help you with:\n\n"
+            "✅ **Solve this with ADD 3.0** (Analysis, Decisions & Design in 3 stages)\n\n"
+            "What would you like to do?\n\n"
+            "1️⃣ **Start with an ASR** (Architecture Significant Requirement)\n"
+            "   - Based on the document, we can draft an ASR that considers its context\n"
+            "   - Try writing: *\"Create ASR for [the document topic]\"*\n\n"
+            "2️⃣ **Ask me a specific question**\n"
+            "   - What do you need to analyze or clarify from the document?\n\n"
+            "3️⃣ **Analyze quality attributes**\n"
+            "   - Latency, scalability, availability, performance, etc.\n"
+        )
+
 def _wants_diagram_of_that_asr(msg: str) -> bool:
     if not msg: return False
     low = msg.lower()
@@ -229,13 +263,13 @@ def health():
 @app.post("/message")
 async def message(
     request: Request,
-    message: str = Form(...),
+    message: str = Form(default=""),
     session_id: str = Form(...),
     image1: Optional[UploadFile] = File(None),
     image2: Optional[UploadFile] = File(None),
 ):
-    if not message:
-        raise HTTPException(status_code=400, detail="No message provided")
+    if not message and not image1 and not image2:
+        raise HTTPException(status_code=400, detail="Message or file(s) required")
     if not session_id:
         raise HTTPException(status_code=400, detail="No session ID provided")
 
@@ -357,6 +391,27 @@ async def message(
     elif _wants_deployment(message):
         user_intent = "diagram"
 
+    # ========== CASO ESPECIAL: DOC-ONLY SIN PROMPT ==========
+    # Si se subió solo PDF/documento sin escribir nada, mostrar sugerencia de ADD 3.0
+    if doc_only and not message.strip():
+        suggestion_msg = _generate_doc_only_suggestion(user_lang)
+        upsert_feedback(session_id=session_id, message_id=message_id, up=0, down=0)
+        
+        return {
+            "endMessage": suggestion_msg,
+            "mermaidCode": "",
+            "diagram": {},
+            "messages": [],
+            "session_id": session_id,
+            "message_id": message_id,
+            "thread_id": thread_id,
+            "suggestions": [
+                "Create an ASR for this document",
+                "Analyze quality attributes",
+                "Ask me a question about the document"
+            ],
+        }
+    # ========== FIN CASO ESPECIAL ==========
 
     # --- Limpieza parcial del estado (sin borrar historial persistente del grafo) ---
     try:
